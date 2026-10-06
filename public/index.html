@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#14213d">
+<title>Parivahan Transaction Lookup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>Transaction lookup</h1>
+    <p>Check Parivahan payment status for one or many Application / Challan numbers.</p>
+  </header>
+
+  <form id="form">
+    <label for="numbers">Application / Challan numbers</label>
+    <textarea id="numbers" rows="4" placeholder="FNHR26107623401&#10;One number per line" spellcheck="false" autocapitalize="characters" autocomplete="off"></textarea>
+    <div class="count">
+      <label for="count">Search this many in a row, counting up from the first number</label>
+      <input id="count" type="number" min="1" max="100" value="1" inputmode="numeric">
+    </div>
+    <div class="row">
+      <button type="submit" id="go" class="primary">Search</button>
+      <label class="file">Load CSV<input type="file" id="file" accept=".csv,.txt"></label>
+      <button type="button" id="clear" class="quiet">Clear</button>
+    </div>
+    <p id="hint" class="hint">Up to 100 numbers. Searches run one at a time.</p>
+  </form>
+
+  <section id="results-wrap" hidden>
+    <div class="bar">
+      <h2 id="progress" aria-live="polite"></h2>
+      <div class="actions">
+        <button type="button" id="stop" class="danger" hidden>Stop</button>
+        <button type="button" id="copy-all" class="quiet">Copy all</button>
+        <button type="button" id="csv" class="quiet">Export CSV</button>
+        <button type="button" id="xlsx" class="quiet">Export Excel</button>
+      </div>
+    </div>
+    <div id="meter" class="meter" hidden><div id="bar"></div></div>
+    <ol id="results"></ol>
+  </section>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+<script src="app.js"></script>
+</body>
+</html>

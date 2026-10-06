@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: parivahan-lookup
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: ACCESS_KEY
+        sync: false
