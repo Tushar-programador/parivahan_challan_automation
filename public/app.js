@@ -203,9 +203,13 @@ $('form').addEventListener('submit', async (e) => {
   $('results-wrap').hidden = false;
   render(numbers);
   controller = new AbortController();
+  let finished = true;
   for (const n of numbers) {
     const result = await searchOne(n, controller.signal);
-    if (!result) break;
+    if (!result) {
+      finished = false;
+      break;
+    }
     results.push(result);
     render(numbers);
   }
@@ -213,6 +217,7 @@ $('form').addEventListener('submit', async (e) => {
   running = false;
   $('go').disabled = false;
   render(numbers);
+  if (finished && $('auto').value !== 'off') exportAs('xlsx', $('auto').value);
 });
 
 $('stop').addEventListener('click', () => {
@@ -237,20 +242,36 @@ $('file').addEventListener('change', async (e) => {
 
 $('copy-all').addEventListener('click', () => (results.some(Boolean) ? copy(tsv()) : toast('Nothing to copy yet')));
 
-async function exportAs(format) {
-  const done = results.filter(Boolean);
-  if (!done.length) return toast('Nothing to export yet');
+const stamp = () => new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '').replace(/^(\d{8})(\d{4})$/, '$1-$2');
+
+// scope: 'all' or 'found'. Returns false when there was nothing to download.
+async function exportAs(format, scope = 'all') {
+  const done = results.filter((r) => r && (scope === 'all' || r.status === 'FOUND'));
+  if (!done.length) {
+    toast(scope === 'found' ? 'No found results to download' : 'Nothing to export yet');
+    return false;
+  }
   const res = await api(`/api/export?format=${format}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ results: done })
   });
-  if (!res.ok) return toast('Export failed');
+  if (!res.ok) {
+    toast('Download failed');
+    return false;
+  }
   const a = document.createElement('a');
   a.href = URL.createObjectURL(await res.blob());
-  a.download = `parivahan-results.${format}`;
+  a.download = `parivahan-${scope}-${stamp()}.${format}`;
   a.click();
   URL.revokeObjectURL(a.href);
+  toast(`Downloaded ${done.length} ${scope === 'found' ? 'found ' : ''}result${done.length === 1 ? '' : 's'}`);
+  return true;
 }
 $('csv').addEventListener('click', () => exportAs('csv'));
 $('xlsx').addEventListener('click', () => exportAs('xlsx'));
+$('xlsx-found').addEventListener('click', () => exportAs('xlsx', 'found'));
+
+const AUTO_KEY = 'parivahan-auto-download';
+try { $('auto').value = localStorage.getItem(AUTO_KEY) || 'all'; } catch { /* default */ }
+$('auto').addEventListener('change', () => { try { localStorage.setItem(AUTO_KEY, $('auto').value); } catch { /* not saved */ } });

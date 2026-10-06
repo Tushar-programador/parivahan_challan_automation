@@ -28,6 +28,13 @@
       <label class="file">Load CSV<input type="file" id="file" accept=".csv,.txt"></label>
       <button type="button" id="clear" class="quiet">Clear</button>
     </div>
+    <label class="auto" for="auto">When the search finishes, download
+      <select id="auto">
+        <option value="all">Excel with all results</option>
+        <option value="found">Excel with found only</option>
+        <option value="off">nothing</option>
+      </select>
+    </label>
     <p id="hint" class="hint">Up to 100 numbers. Searches run one at a time.</p>
   </form>
 
@@ -37,8 +44,9 @@
       <div class="actions">
         <button type="button" id="stop" class="danger" hidden>Stop</button>
         <button type="button" id="copy-all" class="quiet">Copy all</button>
-        <button type="button" id="csv" class="quiet">Export CSV</button>
-        <button type="button" id="xlsx" class="quiet">Export Excel</button>
+        <button type="button" id="xlsx-found" class="quiet">Excel: found only</button>
+        <button type="button" id="xlsx" class="quiet">Excel: all results</button>
+        <button type="button" id="csv" class="quiet">CSV: all results</button>
       </div>
     </div>
     <div id="meter" class="meter" hidden><div id="bar"></div></div>
