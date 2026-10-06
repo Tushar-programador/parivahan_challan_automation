@@ -237,7 +237,7 @@
       <textarea id="nums" placeholder="FNHR26107623401" spellcheck="false" autocapitalize="characters" autocomplete="off"></textarea>
       <label for="count" class="small" style="margin-top:10px">Search this many in a row, counting up from the first number</label>
       <input id="count" type="number" min="1" max="${MAX}" value="1" inputmode="numeric">
-      <label for="auto" class="small" style="margin-top:10px">When the search finishes, download</label>
+      <label for="auto" class="small" style="margin-top:10px">When the search finishes,Automatic download</label>
       <select id="auto"><option value="all">Excel with all results</option><option value="found">Excel with found only</option><option value="off">nothing</option></select>
       <div class="row">
         <button class="primary" id="go" type="button">Search</button>
