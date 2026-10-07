@@ -8,7 +8,7 @@ const {
   LAUNCH_OPTIONS
 } = require('./automation');
 
-const MAX_BULK_ROWS = 100;
+const MAX_BULK_ROWS = 1000;
 const DEFAULT_DELAY_MS = 1000;
 const RESULT_COLUMNS = [
   ['applicationNo', 'Application No'],

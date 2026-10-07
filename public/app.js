@@ -1,4 +1,4 @@
-const MAX = 100;
+const MAX = 1000;
 const $ = (id) => document.getElementById(id);
 const FIELDS = [
   ['vehicleNo', 'Vehicle no'], ['transactionNo', 'Transaction no'], ['paymentId', 'Payment ID'],
@@ -194,7 +194,7 @@ $('form').addEventListener('submit', async (e) => {
     hint.className = 'hint err';
     return;
   }
-  hint.textContent = 'Up to 100 numbers. Searches run one at a time.';
+  hint.textContent = 'Up to 1000 numbers. Searches run one at a time.';
   hint.className = 'hint';
   results = [];
   openCards.clear();

@@ -31,7 +31,7 @@ const upload = multer({
   limits: { fileSize: 1024 * 1024, files: 1 }
 });
 
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '5mb' }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
 app.use('/api', requireAccessKey);
 
@@ -119,7 +119,7 @@ app.post('/api/export', async (req, res) => {
   const items = req.body && req.body.results;
   const format = String(req.query.format || 'csv').toLowerCase();
   if (!Array.isArray(items) || items.length === 0 || items.length > MAX_BULK_ROWS) {
-    return res.status(400).json({ status: 'INVALID_INPUT', message: 'Provide 1-100 results to export.' });
+    return res.status(400).json({ status: 'INVALID_INPUT', message: 'Provide 1-1000 results to export.' });
   }
   const results = items.map((item) => normalizeBulkResult(item || {}, (item && item.applicationNo) || ''));
   if (format === 'csv') {

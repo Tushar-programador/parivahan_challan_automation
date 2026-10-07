@@ -16,7 +16,7 @@
   window.__parivahanLookup = true;
 
   const SEARCH_URL = '/eTransPgi/paymentDetails';
-  const MAX = 100;
+  const MAX = 1000;
   const DELAY_MS = 1000;
   const TIMEOUT_MS = 20000;
   const VALID = /^[A-Z0-9-]{6,50}$/;
