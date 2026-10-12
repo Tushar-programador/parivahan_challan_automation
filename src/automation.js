@@ -1,4 +1,5 @@
 const { chromium } = require('playwright');
+const { createLimiter } = require('./limiter');
 
 const TRANSACTION_STATUS_URL = 'https://vahan.parivahan.gov.in/eTransPgi/transactionStatus';
 const VALID_INPUT = /^[A-Za-z0-9-]+$/;
@@ -167,7 +168,8 @@ async function searchTransactionOnPage(page, applicationNo) {
 
 // One shared headless browser, so repeated searches (UI bulk) don't pay launch cost each time.
 let browserPromise;
-let queue = Promise.resolve();
+const SEARCH_CONCURRENCY = Number.parseInt(process.env.SEARCH_CONCURRENCY, 10) || 5;
+const limit = createLimiter(SEARCH_CONCURRENCY);
 
 function getBrowser() {
   if (!browserPromise) {
@@ -188,16 +190,14 @@ async function runSearch(applicationNo) {
   }
 }
 
-// Searches run one at a time to stay polite to the government site.
+// Up to SEARCH_CONCURRENCY searches run at once (default 5); set it to 1 to go easy on the government site.
 function searchTransaction(applicationNo, options = {}) {
   const cleanApplicationNo = normalizeApplicationNumber(applicationNo);
   if (!isValidApplicationNumber(cleanApplicationNo)) return Promise.resolve(invalidResult(cleanApplicationNo));
 
-  const run = queue.then(() => (options.cancelled && options.cancelled()
+  return limit(() => (options.cancelled && options.cancelled()
     ? { status: 'CANCELLED', applicationNo: cleanApplicationNo }
     : runSearch(cleanApplicationNo)));
-  queue = run.catch(() => {});
-  return run;
 }
 
 async function closeBrowser() {

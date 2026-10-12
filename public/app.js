@@ -81,6 +81,8 @@ function tsv() {
 }
 
 const openCards = new Set();
+const searching = new Set();
+const CONCURRENCY = 5;
 
 function render(numbers) {
   const ol = $('results');
@@ -106,7 +108,7 @@ function render(numbers) {
     }
     const chip = document.createElement('span');
     chip.className = 'chip';
-    chip.textContent = r ? (LABELS[r.status] || r.status) : (running ? (i === results.length ? 'Searching' : 'Waiting') : 'Not searched');
+    chip.textContent = r ? (LABELS[r.status] || r.status) : (running ? (searching.has(i) ? 'Searching' : 'Waiting') : 'Not searched');
     head.append(left, chip);
 
     if (hasData) {
@@ -147,7 +149,7 @@ function render(numbers) {
   $('meter').hidden = !running;
   $('stop').hidden = !running;
   $('progress').textContent = running
-    ? `Searching ${Math.min(done + 1, numbers.length)} of ${numbers.length}`
+    ? `Searched ${done} of ${numbers.length}`
     : `${found} of ${numbers.length} found${done < numbers.length ? ` (stopped after ${done})` : ''}`;
 }
 
@@ -194,7 +196,7 @@ $('form').addEventListener('submit', async (e) => {
     hint.className = 'hint err';
     return;
   }
-  hint.textContent = 'Up to 1000 numbers. Searches run one at a time.';
+  hint.textContent = 'Up to 1000 numbers. Up to 5 searches run at a time.';
   hint.className = 'hint';
   results = [];
   openCards.clear();
@@ -203,16 +205,26 @@ $('form').addEventListener('submit', async (e) => {
   $('results-wrap').hidden = false;
   render(numbers);
   controller = new AbortController();
+  const { signal } = controller;
   let finished = true;
-  for (const n of numbers) {
-    const result = await searchOne(n, controller.signal);
-    if (!result) {
-      finished = false;
-      break;
+  let nextIndex = 0;
+  const worker = async () => {
+    while (!signal.aborted && nextIndex < numbers.length) {
+      const i = nextIndex++;
+      searching.add(i);
+      render(numbers);
+      const result = await searchOne(numbers[i], signal);
+      searching.delete(i);
+      if (!result) {
+        finished = false;
+        return;
+      }
+      results[i] = result;
+      render(numbers);
     }
-    results.push(result);
-    render(numbers);
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, numbers.length) }, worker));
+  searching.clear();
   controller = null;
   running = false;
   $('go').disabled = false;
