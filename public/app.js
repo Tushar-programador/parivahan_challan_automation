@@ -81,12 +81,12 @@ function tsv() {
 }
 
 const openCards = new Set();
-const searching = new Set();
-const CONCURRENCY = 5;
+const CONCURRENCY = 20; // matches the server's default SEARCH_CONCURRENCY; only affects the "Searching" label
 
 function render(numbers) {
   const ol = $('results');
   ol.textContent = '';
+  let slots = CONCURRENCY;
   numbers.forEach((n, i) => {
     const r = results[i];
     const li = document.createElement('li');
@@ -108,7 +108,7 @@ function render(numbers) {
     }
     const chip = document.createElement('span');
     chip.className = 'chip';
-    chip.textContent = r ? (LABELS[r.status] || r.status) : (running ? (searching.has(i) ? 'Searching' : 'Waiting') : 'Not searched');
+    chip.textContent = r ? (LABELS[r.status] || r.status) : (running ? (slots-- > 0 ? 'Searching' : 'Waiting') : 'Not searched');
     head.append(left, chip);
 
     if (hasData) {
@@ -153,20 +153,48 @@ function render(numbers) {
     : `${found} of ${numbers.length} found${done < numbers.length ? ` (stopped after ${done})` : ''}`;
 }
 
-async function searchOne(n, signal) {
+// One request streams back a JSON line per finished search, so all of them run in parallel on the
+// server without hitting the browser's per-host connection limit. Returns false if stopped.
+async function searchAll(numbers, signal) {
+  const failRemaining = (message) => numbers.forEach((n, i) => {
+    if (!results[i]) results[i] = { status: 'WEBSITE_ERROR', applicationNo: n, message };
+  });
   try {
-    const res = await api('/api/transaction/search', {
+    const res = await api('/api/transaction/search-stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ applicationNo: n }),
+      body: JSON.stringify({ applicationNos: numbers }),
       signal
     });
-    const body = await res.json();
-    if (res.status === 401) return { status: 'WEBSITE_ERROR', applicationNo: n, message: body.message };
-    return body;
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      failRemaining(body.message || 'The server could not process the request.');
+      return true;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffered = '';
+    const take = (line) => {
+      if (!line.trim()) return;
+      const { index, result } = JSON.parse(line);
+      results[index] = result;
+      render(numbers);
+    };
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffered += decoder.decode(value, { stream: true });
+      const lines = buffered.split('\n');
+      buffered = lines.pop();
+      lines.forEach(take);
+    }
+    take(buffered);
+    failRemaining('The server stopped before returning this result.');
+    return true;
   } catch (error) {
-    if (error && error.name === 'AbortError') return null;
-    return { status: 'WEBSITE_ERROR', applicationNo: n, message: 'Could not reach the local server. Check that it is running.' };
+    if (error && error.name === 'AbortError') return false;
+    failRemaining('Could not reach the local server. Check that it is running.');
+    return true;
   }
 }
 
@@ -196,7 +224,7 @@ $('form').addEventListener('submit', async (e) => {
     hint.className = 'hint err';
     return;
   }
-  hint.textContent = 'Up to 1000 numbers. Up to 5 searches run at a time.';
+  hint.textContent = 'Up to 1000 numbers. Up to 20 searches run at a time.';
   hint.className = 'hint';
   results = [];
   openCards.clear();
@@ -206,25 +234,7 @@ $('form').addEventListener('submit', async (e) => {
   render(numbers);
   controller = new AbortController();
   const { signal } = controller;
-  let finished = true;
-  let nextIndex = 0;
-  const worker = async () => {
-    while (!signal.aborted && nextIndex < numbers.length) {
-      const i = nextIndex++;
-      searching.add(i);
-      render(numbers);
-      const result = await searchOne(numbers[i], signal);
-      searching.delete(i);
-      if (!result) {
-        finished = false;
-        return;
-      }
-      results[i] = result;
-      render(numbers);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, numbers.length) }, worker));
-  searching.clear();
+  const finished = await searchAll(numbers, signal);
   controller = null;
   running = false;
   $('go').disabled = false;

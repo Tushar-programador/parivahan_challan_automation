@@ -168,7 +168,7 @@ async function searchTransactionOnPage(page, applicationNo) {
 
 // One shared headless browser, so repeated searches (UI bulk) don't pay launch cost each time.
 let browserPromise;
-const SEARCH_CONCURRENCY = Number.parseInt(process.env.SEARCH_CONCURRENCY, 10) || 5;
+const SEARCH_CONCURRENCY = Number.parseInt(process.env.SEARCH_CONCURRENCY, 10) || 20;
 const limit = createLimiter(SEARCH_CONCURRENCY);
 
 function getBrowser() {
@@ -190,7 +190,7 @@ async function runSearch(applicationNo) {
   }
 }
 
-// Up to SEARCH_CONCURRENCY searches run at once (default 5); set it to 1 to go easy on the government site.
+// Up to SEARCH_CONCURRENCY searches run at once (default 20); set it to 1 to go easy on the government site.
 function searchTransaction(applicationNo, options = {}) {
   const cleanApplicationNo = normalizeApplicationNumber(applicationNo);
   if (!isValidApplicationNumber(cleanApplicationNo)) return Promise.resolve(invalidResult(cleanApplicationNo));

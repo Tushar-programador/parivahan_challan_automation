@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const express = require('express');
 const { searchTransaction, closeBrowser } = require('./automation');
 const multer = require('multer');
+const { runBatch } = require('./stream');
 const {
   MAX_BULK_ROWS,
   parseApplicationNumbers,
@@ -65,6 +66,34 @@ app.post('/api/transaction/search', async (req, res) => {
       message: `Unexpected server error: ${message}`
     });
   }
+});
+
+// Streams one JSON line per finished search ({ index, result }) so the UI needs only one connection,
+// which gets around the browser's ~6 connections per host limit.
+app.post('/api/transaction/search-stream', async (req, res) => {
+  const applicationNos = req.body && req.body.applicationNos;
+  if (!Array.isArray(applicationNos) || applicationNos.length === 0 || applicationNos.length > MAX_BULK_ROWS) {
+    return res.status(400).json({
+      status: 'INVALID_INPUT',
+      message: `Provide 1-${MAX_BULK_ROWS} application numbers in applicationNos.`
+    });
+  }
+
+  let clientGone = false;
+  res.on('close', () => { clientGone = !res.writableEnded; });
+
+  res.type('application/x-ndjson');
+  res.flushHeaders();
+  await runBatch(
+    applicationNos,
+    (applicationNo) => searchTransaction(applicationNo, { cancelled: () => clientGone }),
+    (item) => {
+      if (clientGone) return false;
+      res.write(`${JSON.stringify(item)}\n`);
+      return true;
+    }
+  );
+  return res.end();
 });
 
 app.post('/api/transaction/bulk', upload.single('file'), async (req, res) => {
