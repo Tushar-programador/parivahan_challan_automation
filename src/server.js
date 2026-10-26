@@ -12,6 +12,7 @@ const {
   searchWithCaptcha
 } = require('./automation');
 const { createSessionStore, SessionError } = require('./sessions');
+const { saveCaptchaImage } = require('./captcha-images');
 const multer = require('multer');
 const { runBatch } = require('./stream');
 const {
@@ -106,6 +107,16 @@ app.post('/api/transaction/search-stream', async (req, res) => {
 // session's browser page, a person types it, and the server submits it from that same page.
 const sessions = createSessionStore();
 const SESSION_ERROR_STATUS = { NOT_FOUND: 404, BUSY: 409, TOO_MANY: 429 };
+const CAPTCHA_IMAGE_DIR = process.env.CAPTCHA_IMAGE_DIR || path.join(__dirname, '..', 'images');
+
+// Every captcha image sent to the UI is also saved to CAPTCHA_IMAGE_DIR. Best effort: a full disk or a
+// locked folder is logged and must never stop a search.
+function keepCaptcha(image) {
+  if (image) {
+    saveCaptchaImage(image, CAPTCHA_IMAGE_DIR).catch((error) => console.error(`Could not save the captcha image: ${error.message}`));
+  }
+  return image;
+}
 
 function sendSessionError(res, error) {
   if (error instanceof SessionError) {
@@ -126,7 +137,7 @@ app.post('/api/captcha/session', async (_req, res) => {
         throw error;
       }
     });
-    return res.status(201).json({ sessionId: id, captcha: value });
+    return res.status(201).json({ sessionId: id, captcha: keepCaptcha(value) });
   } catch (error) {
     return sendSessionError(res, error);
   }
@@ -134,7 +145,7 @@ app.post('/api/captcha/session', async (_req, res) => {
 
 app.post('/api/captcha/session/:id/refresh', async (req, res) => {
   try {
-    return res.json({ captcha: await sessions.use(req.params.id, refreshCaptcha) });
+    return res.json({ captcha: keepCaptcha(await sessions.use(req.params.id, refreshCaptcha)) });
   } catch (error) {
     return sendSessionError(res, error);
   }
@@ -160,7 +171,7 @@ app.post('/api/captcha/session/:id/search', async (req, res) => {
       const result = await searchWithCaptcha(page, applicationNo, captcha);
       if (next === false && result.status !== 'CAPTCHA_WRONG') return { result };
       // The search is already answered; failing to load the next image must not lose that answer.
-      return { result, captcha: await nextCaptcha(page, result).catch(() => null) };
+      return { result, captcha: keepCaptcha(await nextCaptcha(page, result).catch(() => null)) };
     });
     return res.json(payload);
   } catch (error) {
