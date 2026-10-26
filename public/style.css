@@ -87,3 +87,14 @@ button.danger { background: var(--bad-bg); border-color: var(--bad); color: var(
 .auto select { min-height: 44px; padding: 0 10px; font: inherit; color: var(--ink); background: var(--card); border: 1.5px solid var(--line); border-radius: 6px; flex: 1; min-width: 200px; }
 .auto select:focus-visible { outline: 3px solid var(--saffron); outline-offset: 2px; }
 @media (max-width: 520px) { .actions { grid-template-columns: 1fr 1fr; } #copy-all { grid-column: 1 / -1; } }
+.captcha { margin-top: 20px; padding: 14px; background: var(--card); border: 1.5px solid var(--saffron); border-radius: 8px; }
+.captcha[hidden] { display: none; }
+.cap-for { margin: 0 0 10px; color: var(--muted); font-size: .95rem; }
+.cap-for b { color: var(--ink); word-break: break-all; }
+.cap-line { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cap-line img { height: 48px; min-width: 120px; background: #fff; border: 1px solid var(--line); border-radius: 4px; }
+.cap-line input { flex: 1; min-width: 140px; min-height: 48px; padding: 0 12px; font: 600 1.3rem/1 ui-monospace, Consolas, monospace; letter-spacing: .2em; text-transform: uppercase; color: var(--ink); background: var(--paper); border: 1.5px solid var(--line); border-radius: 6px; }
+.cap-line input:focus { outline: 3px solid var(--saffron); outline-offset: 2px; }
+.cap-line input:disabled, #cap-refresh:disabled { opacity: .55; }
+.captcha .hint.err { margin-top: 10px; }
+@media (max-width: 520px) { .cap-line input { flex-basis: 100%; } }

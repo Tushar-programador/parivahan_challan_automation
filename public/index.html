@@ -35,7 +35,20 @@
         <option value="off">nothing</option>
       </select>
     </label>
-    <p id="hint" class="hint">Up to 1000 numbers. Up to 20 searches run at a time.</p>
+    <p id="hint" class="hint">Up to 1000 numbers. The portal asks for a captcha on every search, so you type one for each number.</p>
+  </form>
+
+  <form id="captcha-card" class="captcha" hidden>
+    <p class="cap-for">Type the captcha for <b id="cap-number"></b></p>
+    <div class="cap-line">
+      <img id="cap-img" alt="Captcha image">
+      <button type="button" id="cap-refresh" class="quiet" aria-label="Load a new captcha image" title="New image">&#8635;</button>
+      <input id="cap-input" type="text" maxlength="6" placeholder="Captcha" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="Captcha text">
+    </div>
+    <p id="cap-error" class="hint err" role="alert" hidden></p>
+    <div class="row">
+      <button type="submit" id="cap-go" class="primary">Search this number</button>
+    </div>
   </form>
 
   <section id="results-wrap" hidden>

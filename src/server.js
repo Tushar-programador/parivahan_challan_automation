@@ -1,7 +1,17 @@
 const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
-const { searchTransaction, closeBrowser } = require('./automation');
+const {
+  searchTransaction,
+  closeBrowser,
+  isValidCaptcha,
+  openSearchPage,
+  prepareSearchForm,
+  refreshCaptcha,
+  nextCaptcha,
+  searchWithCaptcha
+} = require('./automation');
+const { createSessionStore, SessionError } = require('./sessions');
 const multer = require('multer');
 const { runBatch } = require('./stream');
 const {
@@ -51,12 +61,8 @@ app.post('/api/transaction/search', async (req, res) => {
     });
   }
 
-  // The UI's Stop button aborts the request; searches still queued behind it are skipped.
-  let clientGone = false;
-  res.on('close', () => { clientGone = !res.writableEnded; });
-
   try {
-    const result = await searchTransaction(applicationNo, { cancelled: () => clientGone });
+    const result = await searchTransaction(applicationNo);
     return res.json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -86,7 +92,7 @@ app.post('/api/transaction/search-stream', async (req, res) => {
   res.flushHeaders();
   await runBatch(
     applicationNos,
-    (applicationNo) => searchTransaction(applicationNo, { cancelled: () => clientGone }),
+    (applicationNo) => searchTransaction(applicationNo),
     (item) => {
       if (clientGone) return false;
       res.write(`${JSON.stringify(item)}\n`);
@@ -94,6 +100,77 @@ app.post('/api/transaction/search-stream', async (req, res) => {
     }
   );
   return res.end();
+});
+
+// Attended searches: the portal wants a captcha for every search, so the UI shows the image from a
+// session's browser page, a person types it, and the server submits it from that same page.
+const sessions = createSessionStore();
+const SESSION_ERROR_STATUS = { NOT_FOUND: 404, BUSY: 409, TOO_MANY: 429 };
+
+function sendSessionError(res, error) {
+  if (error instanceof SessionError) {
+    return res.status(SESSION_ERROR_STATUS[error.code]).json({ status: error.code, message: error.message });
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return res.status(500).json({ status: 'WEBSITE_ERROR', message: `Unexpected server error: ${message}` });
+}
+
+app.post('/api/captcha/session', async (_req, res) => {
+  try {
+    const { id, value } = await sessions.create(async () => {
+      const page = await openSearchPage();
+      try {
+        return { page, value: await prepareSearchForm(page) };
+      } catch (error) {
+        await page.close().catch(() => {});
+        throw error;
+      }
+    });
+    return res.status(201).json({ sessionId: id, captcha: value });
+  } catch (error) {
+    return sendSessionError(res, error);
+  }
+});
+
+app.post('/api/captcha/session/:id/refresh', async (req, res) => {
+  try {
+    return res.json({ captcha: await sessions.use(req.params.id, refreshCaptcha) });
+  } catch (error) {
+    return sendSessionError(res, error);
+  }
+});
+
+// Body: { applicationNo, captcha, next }. `next: false` says no number follows, so no new image is needed
+// (unless the captcha was wrong and the same number is tried again).
+app.post('/api/captcha/session/:id/search', async (req, res) => {
+  const { applicationNo, captcha, next } = req.body || {};
+  if (!applicationNo || String(applicationNo).trim() === '') {
+    return res.status(400).json({ status: 'INVALID_INPUT', applicationNo: '', message: 'Application/Challan number is required.' });
+  }
+  if (!isValidCaptcha(captcha)) {
+    return res.status(400).json({
+      status: 'INVALID_INPUT',
+      applicationNo: String(applicationNo).trim(),
+      message: 'Type the 6 letters or digits shown in the captcha image.'
+    });
+  }
+
+  try {
+    const payload = await sessions.use(req.params.id, async (page) => {
+      const result = await searchWithCaptcha(page, applicationNo, captcha);
+      if (next === false && result.status !== 'CAPTCHA_WRONG') return { result };
+      // The search is already answered; failing to load the next image must not lose that answer.
+      return { result, captcha: await nextCaptcha(page, result).catch(() => null) };
+    });
+    return res.json(payload);
+  } catch (error) {
+    return sendSessionError(res, error);
+  }
+});
+
+app.delete('/api/captcha/session/:id', async (req, res) => {
+  await sessions.close(req.params.id);
+  return res.status(204).end();
 });
 
 app.post('/api/transaction/bulk', upload.single('file'), async (req, res) => {
@@ -189,5 +266,5 @@ const server = app.listen(PORT, HOST, () => {
 
 process.on('SIGINT', () => {
   server.close();
-  closeBrowser().finally(() => process.exit(0));
+  sessions.closeAll().then(closeBrowser).finally(() => process.exit(0));
 });
