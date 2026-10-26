@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Parivahan Transaction Lookup
 // @namespace    https://github.com/Tushar-programador/parivahan_challan_automation
-// @version      1.0.0
-// @description  Look up Parivahan transaction status for one or many Application/Challan numbers from the Transaction Status page, with counting up, copy and CSV export.
+// @version      1.1.0
+// @description  Look up Parivahan transaction status for one or many Application/Challan numbers from the Transaction Status page. You type the page's captcha for each search; counting up, copy and Excel/CSV export included.
 // @match        https://vahan.parivahan.gov.in/eTransPgi/*
 // @grant        none
 // @run-at       document-idle
@@ -16,8 +16,8 @@
   window.__parivahanLookup = true;
 
   const SEARCH_URL = '/eTransPgi/paymentDetails';
+  const CAPTCHA_URL = '/eTransPgi/captcha';
   const MAX = 1000;
-  const DELAY_MS = 1000;
   const TIMEOUT_MS = 20000;
   const VALID = /^[A-Z0-9-]{6,50}$/;
 
@@ -35,15 +35,40 @@
   // "🚗 Vehicle No" -> "vehicleno", "Bank Ref.No" -> "bankrefno"
   const headerKey = (h) => clean(h).replace(/[^A-Za-z0-9]+/g, '').toLowerCase();
 
+  // Ways the site could word a rejected captcha, matched against whatever message it sends back.
+  const CAPTCHA_REJECTED = /(invalid|incorrect|wrong|mismatch|expired|not match)\W+(\w+\W+){0,3}captcha|captcha\W+(\w+\W+){0,4}(invalid|incorrect|wrong|mismatch|expired|not match|failed)/i;
+  const NO_RECORD = /\bno\b[^.]{0,40}\b(record|transaction|data)s?\b[^.]{0,20}\bfound|not found/i;
+
+  // The site reports problems (a wrong captcha, say) between its "ERROR / MESSAGE" and "TRANSACTION RESULTS"
+  // page markers. Returns that text, or null when the markers are gone (the page layout changed).
+  function siteMessage(doc) {
+    const walker = doc.createTreeWalker(doc, NodeFilter.SHOW_COMMENT);
+    let from = null;
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if (!from && /ERROR\s*\/\s*MESSAGE/i.test(node.data)) from = node;
+      else if (from && /TRANSACTION\s+RESULTS/i.test(node.data)) {
+        let text = '';
+        for (let sib = from.nextSibling; sib && sib !== node; sib = sib.nextSibling) text += ` ${sib.textContent}`;
+        return clean(text);
+      }
+    }
+    return null;
+  }
+
   function parseResult(html, applicationNo) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const headers = [...doc.querySelectorAll('table thead th')].map((th) => th.textContent);
     const rows = [...doc.querySelectorAll('table tbody tr')].map((tr) => [...tr.querySelectorAll('td')].map((td) => clean(td.textContent)));
 
     if (!rows.length) {
-      return /no record found/i.test(doc.body ? doc.body.textContent : '')
-        ? { status: 'NOT_FOUND', applicationNo }
-        : { status: 'WEBSITE_ERROR', applicationNo, message: 'Unexpected response from the site. Reload the page and try again.' };
+      const message = siteMessage(doc);
+      if (CAPTCHA_REJECTED.test(message || '') || CAPTCHA_REJECTED.test(clean(doc.body ? doc.body.textContent : ''))) {
+        return { status: 'CAPTCHA_WRONG', applicationNo };
+      }
+      // Never guess "not found" when the page no longer looks like the one we know.
+      if (message === null) return { status: 'WEBSITE_ERROR', applicationNo, message: 'Unexpected response from the site. Reload the page and try again.' };
+      if (message && !NO_RECORD.test(message)) return { status: 'WEBSITE_ERROR', applicationNo, message };
+      return { status: 'NOT_FOUND', applicationNo };
     }
     const row = rows.find((c) => c.length >= 14 && !(c[12] || '').toLowerCase().includes('subtotal'));
     if (!row) {
@@ -72,11 +97,10 @@
     };
   }
 
-  // Same-origin POST, exactly what the page's own Search button sends.
-  async function searchOne(applicationNo, signal) {
-    if (!VALID.test(applicationNo)) {
-      return { status: 'INVALID_INPUT', applicationNo, message: 'Must be 6-50 letters, numbers or hyphens.' };
-    }
+  const invalidResult = (applicationNo) => ({ status: 'INVALID_INPUT', applicationNo, message: 'Must be 6-50 letters, numbers or hyphens.' });
+
+  // Same-origin POST, exactly what the page's own Search button sends. `captcha` is what you typed for the image on screen.
+  async function searchOne(applicationNo, captcha, signal) {
     const timer = new AbortController();
     const timeout = setTimeout(() => timer.abort(), TIMEOUT_MS);
     const onStop = () => timer.abort();
@@ -85,10 +109,11 @@
       const res = await fetch(SEARCH_URL, {
         method: 'POST',
         credentials: 'same-origin',
-        body: new URLSearchParams({ selection: '6', 'Challan No./Application No.': applicationNo }),
+        body: new URLSearchParams({ selection: '6', 'Challan No./Application No.': applicationNo, captcha }),
         signal: timer.signal
       });
       if (!res.ok) return { status: 'WEBSITE_ERROR', applicationNo, message: `The site answered with HTTP ${res.status}.` };
+      if (/session-expired/.test(res.url)) return { status: 'WEBSITE_ERROR', applicationNo, message: 'The portal session expired. Reload the page and start again.' };
       return parseResult(await res.text(), applicationNo);
     } catch (err) {
       if (signal.aborted) return null;
@@ -210,6 +235,11 @@
   button:disabled { opacity: .55; }
   :focus-visible { outline: 3px solid var(--saf); outline-offset: 2px; }
   .err { color: var(--bad); font-size: 13px; margin: 8px 0 0; }
+  .cap { margin-top: 14px; padding: 12px; background: var(--card); border: 1.5px solid var(--saf); border-radius: 8px; }
+  .cap b { word-break: break-all; }
+  .capline { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+  .capline img { height: 38px; width: 130px; background: #fff; border: 1px solid var(--line); border-radius: 4px; }
+  .capline input { flex: 1; min-width: 0; font: 600 18px/1 ui-monospace, Consolas, monospace; letter-spacing: 3px; text-transform: uppercase; color: var(--ink); background: var(--paper); border: 1.5px solid var(--line); border-radius: 6px; padding: 8px 10px; }
   .bar { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 14px 0 8px; flex-wrap: wrap; }
   .bar b { font-size: 15px; }
   .meter { height: 5px; background: var(--line); border-radius: 3px; overflow: hidden; margin-bottom: 10px; }
@@ -240,11 +270,21 @@
       <label for="auto" class="small" style="margin-top:10px">When the search finishes,Automatic download</label>
       <select id="auto"><option value="all">Excel with all results</option><option value="found">Excel with found only</option><option value="off">nothing</option></select>
       <div class="row">
-        <button class="primary" id="go" type="button">Search</button>
+        <button class="primary" id="go" type="button">Start</button>
         <button class="danger" id="stop" type="button" hidden>Stop</button>
         <button class="quiet" id="clear" type="button">Clear</button>
       </div>
       <p class="err" id="err" hidden></p>
+      <div class="cap" id="cap" hidden>
+        <div class="small">Type the captcha for <b id="capfor"></b></div>
+        <div class="capline">
+          <img id="capimg" alt="Captcha image" width="130" height="38">
+          <button class="quiet" id="caprefresh" type="button" title="New image" aria-label="Load a new captcha image">&#8635;</button>
+          <input id="capin" type="text" maxlength="6" placeholder="Captcha" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="Captcha text">
+        </div>
+        <p class="err" id="caperr" hidden></p>
+        <div class="row"><button class="primary" id="capgo" type="button">Search this number</button></div>
+      </div>
       <div id="out" hidden>
         <div class="bar"><b id="progress" aria-live="polite"></b>
           </div>
@@ -260,10 +300,12 @@
   let results = [];
   let numbers = [];
   let running = false;
+  let busy = false; // a search is in flight, waiting for the site
   let controller = null;
   const openCards = new Set();
 
   const showError = (text) => { $('err').textContent = text || ''; $('err').hidden = !text; };
+  const showCaptchaError = (text) => { $('caperr').textContent = text || ''; $('caperr').hidden = !text; };
   async function copy(text) {
     try { await navigator.clipboard.writeText(text); }
     catch { const t = document.createElement('textarea'); t.value = text; document.body.appendChild(t); t.select(); document.execCommand('copy'); t.remove(); }
@@ -288,7 +330,7 @@
         s.textContent = [r.data.vehicleNo, r.data.amount && `Rs ${r.data.amount}`].filter(Boolean).join(' - '); left.append(s);
       }
       const chip = document.createElement('span'); chip.className = 'chip';
-      chip.textContent = r ? (LABELS[r.status] || r.status) : (running ? (i === results.length ? 'Searching' : 'Waiting') : 'Not searched');
+      chip.textContent = r ? (LABELS[r.status] || r.status) : (running ? (i === results.length ? (busy ? 'Searching' : 'Type captcha') : 'Waiting') : 'Not searched');
       head.append(left, chip);
       if (hasData) {
         const det = document.createElement('details');
@@ -317,14 +359,55 @@
     $('meter').hidden = !running;
     $('stop').hidden = !running;
     $('go').disabled = running;
+    $('cap').hidden = !running;
+    $('capfor').textContent = numbers[done] || '';
+    $('capin').disabled = busy;
+    $('capgo').disabled = busy;
     $('progress').textContent = running
-      ? `Searching ${Math.min(done + 1, numbers.length)} of ${numbers.length}`
+      ? `Number ${Math.min(done + 1, numbers.length)} of ${numbers.length}`
       : `${found} of ${numbers.length} found${done < numbers.length ? ` (stopped after ${done})` : ''}`;
   }
 
-  const sleep = (ms, signal) => new Promise((res) => { const t = setTimeout(res, ms); signal.addEventListener('abort', () => { clearTimeout(t); res(); }, { once: true }); });
+  // Fresh captcha image (same session as the search) and an empty box, ready to type.
+  function loadCaptcha() {
+    $('capin').value = '';
+    $('capimg').src = `${CAPTCHA_URL}?t=${Date.now()}`;
+    $('capin').focus();
+  }
 
-  async function run() {
+  // Numbers the site would reject anyway are marked invalid without asking for a captcha.
+  function skipInvalid() {
+    while (results.length < numbers.length && !VALID.test(numbers[results.length])) {
+      results.push(invalidResult(numbers[results.length]));
+    }
+  }
+
+  function finish() {
+    running = false; busy = false; controller = null; render();
+    if ($('auto').value !== 'off') download('xlsx', $('auto').value);
+  }
+
+  // One captcha per search: send what was typed, record the answer, then show a new image for the next number.
+  async function submitCaptcha() {
+    if (!running || busy) return;
+    const code = $('capin').value.trim().toUpperCase();
+    if (!code) return showCaptchaError('Type the captcha shown in the image.');
+    showCaptchaError('');
+    busy = true; render();
+    const result = await searchOne(numbers[results.length], code, controller.signal);
+    busy = false;
+    if (!running || !result) return; // Stop was pressed
+    if (result.status === 'CAPTCHA_WRONG') {
+      render(); loadCaptcha();
+      return showCaptchaError('The captcha was not accepted. Type the new one.');
+    }
+    results.push(result);
+    skipInvalid();
+    if (results.length >= numbers.length) return finish();
+    render(); loadCaptcha();
+  }
+
+  function run() {
     if (running) return;
     let list = parseNumbers($('nums').value);
     const count = Math.floor(Number($('count').value)) || 1;
@@ -337,25 +420,22 @@
     if (list.length > MAX) return showError(`Enter at most ${MAX} numbers. You entered ${list.length}.`);
     showError('');
     numbers = list; results = []; openCards.clear();
-    running = true; controller = new AbortController();
-    $('out').hidden = false; render();
-    for (let i = 0; i < numbers.length; i += 1) {
-      const result = await searchOne(numbers[i], controller.signal);
-      if (!result) break;
-      results.push(result);
-      render();
-      if (i < numbers.length - 1 && result.status !== 'INVALID_INPUT') await sleep(DELAY_MS, controller.signal);
-      if (controller.signal.aborted) break;
-    }
-    const finished = results.length === numbers.length;
-    running = false; controller = null; render();
-    if (finished && $('auto').value !== 'off') download('xlsx', $('auto').value);
+    running = true; busy = false; controller = new AbortController();
+    $('out').hidden = false; showCaptchaError('');
+    skipInvalid();
+    if (results.length >= numbers.length) return finish();
+    render(); loadCaptcha();
   }
 
   $('open').addEventListener('click', () => { $('panel').hidden = false; $('open').hidden = true; });
   $('close').addEventListener('click', () => { $('panel').hidden = true; $('open').hidden = false; });
   $('go').addEventListener('click', run);
-  $('stop').addEventListener('click', () => { if (controller) controller.abort(); });
+  $('stop').addEventListener('click', () => { if (controller) controller.abort(); running = false; busy = false; controller = null; render(); });
+  $('capgo').addEventListener('click', submitCaptcha);
+  $('caprefresh').addEventListener('click', () => { showCaptchaError(''); loadCaptcha(); });
+  $('capimg').addEventListener('error', () => showCaptchaError('The captcha image did not load. Press the refresh button.'));
+  $('capin').addEventListener('input', () => { $('capin').value = $('capin').value.toUpperCase().replace(/[^A-Z0-9]/g, ''); });
+  $('capin').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submitCaptcha(); } });
   $('clear').addEventListener('click', () => { if (running) return; $('nums').value = ''; $('count').value = 1; results = []; numbers = []; showError(''); $('out').hidden = true; });
   $('copyall').addEventListener('click', () => (results.length ? copy(toTsv(results)) : showError('Nothing to copy yet.')));
   const AUTO_KEY = 'parivahan-auto-download';

@@ -110,7 +110,7 @@ async function searchTransactionOnPage(page, applicationNo) {
   const cleanApplicationNo = normalizeApplicationNumber(applicationNo);
   if (!isValidApplicationNumber(cleanApplicationNo)) return invalidResult(cleanApplicationNo);
 
-  log(`Starting search for ${cleanApplicationNo}`);
+  // log(`Starting search for ${cleanApplicationNo}`);
   try {
     await loadSearchPage(page);
     log('Transaction page loaded');
@@ -118,7 +118,7 @@ async function searchTransactionOnPage(page, applicationNo) {
     await page.locator('input[name="selection"][value="6"]').check();
     await page.locator('#dynamicTextField').fill(cleanApplicationNo);
     await page.locator('button:has-text("Search")').click();
-    log('Search submitted');
+   
 
     try {
       await page.waitForURL(/paymentDetails/, { timeout: RESULT_TIMEOUT_MS });
@@ -136,7 +136,7 @@ async function searchTransactionOnPage(page, applicationNo) {
     }
 
     if (await page.locator('table tbody tr').count() === 0) {
-      log('No record found');
+      // log('No record found');
       return { status: 'NOT_FOUND', applicationNo: cleanApplicationNo };
     }
 
@@ -149,7 +149,7 @@ async function searchTransactionOnPage(page, applicationNo) {
       };
     }
 
-    log('Transaction extracted');
+    // log('Transaction extracted');
     return {
       status: 'FOUND',
       applicationNo: cleanApplicationNo,
