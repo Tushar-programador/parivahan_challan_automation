@@ -117,7 +117,7 @@ async function searchTransactionOnPage(page, applicationNo) {
 
     await page.locator('input[name="selection"][value="6"]').check();
     await page.locator('#dynamicTextField').fill(cleanApplicationNo);
-    await page.locator('button:has-text("Search")').click();
+    await page.locator('#searchButton').click();
    
 
     try {
@@ -168,7 +168,7 @@ async function searchTransactionOnPage(page, applicationNo) {
 
 // One shared headless browser, so repeated searches (UI bulk) don't pay launch cost each time.
 let browserPromise;
-const SEARCH_CONCURRENCY = Number.parseInt(process.env.SEARCH_CONCURRENCY, 10) || 20;
+const SEARCH_CONCURRENCY = Number.parseInt(process.env.SEARCH_CONCURRENCY, 10) || 1;
 const limit = createLimiter(SEARCH_CONCURRENCY);
 
 function getBrowser() {
@@ -190,7 +190,7 @@ async function runSearch(applicationNo) {
   }
 }
 
-// Up to SEARCH_CONCURRENCY searches run at once (default 20); set it to 1 to go easy on the government site.
+// Up to SEARCH_CONCURRENCY searches run at once (default 1, to go easy on the government site).
 function searchTransaction(applicationNo, options = {}) {
   const cleanApplicationNo = normalizeApplicationNumber(applicationNo);
   if (!isValidApplicationNumber(cleanApplicationNo)) return Promise.resolve(invalidResult(cleanApplicationNo));

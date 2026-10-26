@@ -81,7 +81,7 @@ function tsv() {
 }
 
 const openCards = new Set();
-const CONCURRENCY = 20; // matches the server's default SEARCH_CONCURRENCY; only affects the "Searching" label
+const CONCURRENCY = 1; // matches the server's default SEARCH_CONCURRENCY; only affects the "Searching" label
 
 function render(numbers) {
   const ol = $('results');
