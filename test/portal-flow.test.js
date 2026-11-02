@@ -46,6 +46,7 @@ const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function openFakePortal(browser) {
   const page = await browser.newPage();
   const posts = [];
+  const loads = []; // each time the search form itself is loaded
   await page.route('**/eTransPgi/**', async (route) => {
     const request = route.request();
     const { pathname } = new URL(request.url());
@@ -54,6 +55,7 @@ async function openFakePortal(browser) {
       return route.fulfill({ contentType: 'text/javascript', body: '' });
     }
     if (pathname.endsWith('/captcha')) return route.fulfill({ contentType: 'image/png', body: PNG });
+    if (pathname.endsWith('/transactionStatus')) loads.push(pathname);
     if (pathname.endsWith('/transactionStatus')) return route.fulfill({ contentType: 'text/html', body: layout() });
     if (pathname.endsWith('/paymentDetails')) {
       const sent = new URLSearchParams(request.postData() || '');
@@ -68,7 +70,7 @@ async function openFakePortal(browser) {
     return route.abort();
   });
   page.setDefaultTimeout(10000);
-  return { page, posts };
+  return { page, posts, loads };
 }
 
 let browser;
@@ -224,5 +226,19 @@ test('a malformed number never reaches OCR or the portal', async () => {
   assert.equal(result.status, 'INVALID_INPUT');
   assert.equal(ocr.seen.length, 0);
   assert.equal(posts.length, 0);
+  await page.close();
+});
+
+test('the result page can be searched again without loading the form', async () => {
+  const { page, posts, loads } = await openFakePortal(browser);
+  const ocr = fakeOcr('ABC123', 'DEF456');
+  const first = await searchTransactionOnPage(page, 'FNHR26107623401', { solve: ocr.solve });
+  assert.equal(first.status, 'FOUND');
+
+  const image = await nextCaptcha(page, first);
+  const second = await searchTransactionOnPage(page, 'NOREC0001', { solve: ocr.solve, image });
+  assert.equal(second.status, 'NOT_FOUND');
+  assert.equal(loads.length, 1);
+  assert.deepEqual(posts.map((p) => p.get('captcha')), ['ABC123', 'DEF456']);
   await page.close();
 });

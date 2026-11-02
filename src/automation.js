@@ -1,6 +1,7 @@
 const { chromium } = require('playwright');
 const { createLimiter } = require('./limiter');
-const { readCaptchaText } = require('./ocr');
+const { readCaptchaText, closeOcr } = require('./ocr');
+const { createPagePool } = require('./page-pool');
 
 const TRANSACTION_STATUS_URL = 'https://vahan.parivahan.gov.in/eTransPgi/transactionStatus';
 const VALID_INPUT = /^[A-Za-z0-9-]+$/;
@@ -99,8 +100,9 @@ const LOAD_ATTEMPTS = 3;
 // Images read per number before giving up: each wrong or unreadable code costs a fresh image from the portal.
 const MAX_CAPTCHA_ATTEMPTS = 5;
 // Searches that run at once (default 1, to go easy on the government site).
-const SEARCH_CONCURRENCY = Number.parseInt(process.env.SEARCH_CONCURRENCY, 10) || 1;
+const SEARCH_CONCURRENCY = Number.parseInt(process.env.SEARCH_CONCURRENCY, 10) || 5;
 const limit = createLimiter(SEARCH_CONCURRENCY);
+const pool = createPagePool();
 // Container-friendly flags: no sandbox (runs as root), and /tmp instead of the small /dev/shm.
 const LAUNCH_OPTIONS = { headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] };
 
@@ -300,39 +302,69 @@ async function searchWithOcr(page, applicationNo, image, { solve = readCaptchaTe
   }
 }
 
-// One complete search on `page`: opens the form, reads the captcha and searches, with no one to type anything.
-async function searchTransactionOnPage(page, applicationNo, options) {
+// One complete search on `page`: reads the captcha and searches, with no one to type anything. The form is
+// loaded first unless the caller already has its captcha image (`options.image`), as on a result page.
+async function searchTransactionOnPage(page, applicationNo, options = {}) {
   const cleanApplicationNo = normalizeApplicationNumber(applicationNo);
   if (!isValidApplicationNumber(cleanApplicationNo)) return invalidResult(cleanApplicationNo);
 
-  let image;
-  try {
-    image = await prepareSearchForm(page);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { status: 'WEBSITE_ERROR', applicationNo: cleanApplicationNo, message: `Could not open the portal: ${message}` };
+  let image = options.image;
+  if (!image) {
+    try {
+      image = await prepareSearchForm(page);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { status: 'WEBSITE_ERROR', applicationNo: cleanApplicationNo, message: `Could not open the portal: ${message}` };
+    }
   }
   return searchWithOcr(page, cleanApplicationNo, image, options);
 }
 
+const isAnswer = (result) => result.status === 'FOUND' || result.status === 'NOT_FOUND';
+
+// Searches on `page` and then either keeps it for the next number or, when the portal did not answer
+// cleanly, closes it so the next search starts from a fresh page.
+async function searchAndKeep(page, applicationNo, options, image) {
+  try {
+    const result = await searchTransactionOnPage(page, applicationNo, { ...options, image });
+    if (isAnswer(result)) pool.keep(page, result);
+    else await page.close().catch(() => {});
+    return result;
+  } catch (error) {
+    await page.close().catch(() => {});
+    throw error;
+  }
+}
+
 // Up to SEARCH_CONCURRENCY searches run at once. `options.cancelled()` turns a search that has not
 // started yet into CANCELLED, so a closed browser tab does not leave the rest of a long list running.
+// A page left by the previous search is reused, which skips loading the form again; if that page
+// misbehaves, the number is searched once more from a fresh page.
 function searchTransaction(applicationNo, options = {}) {
   const cleanApplicationNo = normalizeApplicationNumber(applicationNo);
   if (!isValidApplicationNumber(cleanApplicationNo)) return Promise.resolve(invalidResult(cleanApplicationNo));
 
   return limit(async () => {
     if (options.cancelled && options.cancelled()) return { status: 'CANCELLED', applicationNo: cleanApplicationNo };
-    const page = await openSearchPage();
-    try {
-      return await searchTransactionOnPage(page, cleanApplicationNo, options);
-    } finally {
-      await page.close().catch(() => {});
+
+    const warm = pool.take();
+    if (warm) {
+      const image = await nextCaptcha(warm.page, warm.last).catch(() => null);
+      if (image) {
+        const result = await searchAndKeep(warm.page, cleanApplicationNo, options, image);
+        if (isAnswer(result)) return result;
+        log(`Search from a reused page ended as ${result.status}; trying ${cleanApplicationNo} again on a fresh page`);
+      } else {
+        await warm.page.close().catch(() => {});
+      }
     }
+    return searchAndKeep(await openSearchPage(), cleanApplicationNo, options);
   });
 }
 
 async function closeBrowser() {
+  await pool.closeAll();
+  closeOcr();
   if (!browserPromise) return;
   const browser = await browserPromise;
   browserPromise = undefined;
