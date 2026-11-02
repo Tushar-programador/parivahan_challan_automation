@@ -93,7 +93,7 @@ app.post('/api/transaction/search-stream', async (req, res) => {
   res.flushHeaders();
   await runBatch(
     applicationNos,
-    (applicationNo) => searchTransaction(applicationNo),
+    (applicationNo) => searchTransaction(applicationNo, { cancelled: () => clientGone }),
     (item) => {
       if (clientGone) return false;
       res.write(`${JSON.stringify(item)}\n`);

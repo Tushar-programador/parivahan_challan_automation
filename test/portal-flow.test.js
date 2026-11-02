@@ -6,7 +6,9 @@ const {
   prepareSearchForm,
   refreshCaptcha,
   nextCaptcha,
-  searchWithCaptcha
+  searchWithCaptcha,
+  searchWithOcr,
+  searchTransactionOnPage
 } = require('../src/automation');
 
 // A stand-in for the portal, served through request interception so no test touches the real site.
@@ -140,6 +142,87 @@ test('a number the portal would reject is INVALID_INPUT and nothing is sent', as
   const { page, posts } = await openFakePortal(browser);
   await prepareSearchForm(page);
   assert.equal((await searchWithCaptcha(page, 'bad number!', 'ABC123')).status, 'INVALID_INPUT');
+  assert.equal(posts.length, 0);
+  await page.close();
+});
+
+// A stand-in for the OCR step: hands out the given reads in order (null = unreadable) and counts the images it saw.
+function fakeOcr(...reads) {
+  const seen = [];
+  const solve = async (image) => {
+    seen.push(image);
+    return reads[seen.length - 1] ?? null;
+  };
+  return { solve, seen };
+}
+
+test('searching with OCR reads the captcha image and submits what it read', async () => {
+  const { page, posts } = await openFakePortal(browser);
+  const ocr = fakeOcr('ABC123');
+  const result = await searchTransactionOnPage(page, ' fnhr26107623401 ', { solve: ocr.solve });
+  assert.equal(result.status, 'FOUND');
+  assert.equal(result.applicationNo, 'FNHR26107623401');
+  assert.match(ocr.seen[0], /^data:image\/png;base64,/);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].get('captcha'), 'ABC123');
+  await page.close();
+});
+
+test('a captcha the portal rejects is retried with the next image until one is accepted', async () => {
+  const { page, posts } = await openFakePortal(browser);
+  const ocr = fakeOcr('WRONG1', 'WRONG1', 'ABC123');
+  const result = await searchTransactionOnPage(page, 'FNHR26107623401', { solve: ocr.solve });
+  assert.equal(result.status, 'FOUND');
+  assert.deepEqual(posts.map((p) => p.get('captcha')), ['WRONG1', 'WRONG1', 'ABC123']);
+  assert.equal(ocr.seen.length, 3);
+  await page.close();
+});
+
+test('an unreadable image is refreshed without sending anything to the portal', async () => {
+  const { page, posts } = await openFakePortal(browser);
+  const ocr = fakeOcr(null, 'AB', 'ABC123');
+  const result = await searchTransactionOnPage(page, 'FNHR26107623401', { solve: ocr.solve });
+  assert.equal(result.status, 'FOUND');
+  assert.equal(posts.length, 1);
+  assert.equal(ocr.seen.length, 3);
+  await page.close();
+});
+
+test('after the allowed number of images it gives up with CAPTCHA_REQUIRED', async () => {
+  const { page, posts } = await openFakePortal(browser);
+  const ocr = fakeOcr('WRONG1', 'WRONG1', 'WRONG1', 'ABC123');
+  const result = await searchTransactionOnPage(page, 'FNHR26107623401', { solve: ocr.solve, attempts: 3 });
+  assert.equal(result.status, 'CAPTCHA_REQUIRED');
+  assert.equal(result.applicationNo, 'FNHR26107623401');
+  assert.match(result.message, /3 tries/);
+  assert.equal(posts.length, 3);
+  assert.equal(ocr.seen.length, 3);
+  await page.close();
+});
+
+test('a no record answer ends the OCR search at once', async () => {
+  const { page, posts } = await openFakePortal(browser);
+  const ocr = fakeOcr('ABC123', 'ABC123');
+  const result = await searchTransactionOnPage(page, 'NOREC0001', { solve: ocr.solve });
+  assert.equal(result.status, 'NOT_FOUND');
+  assert.equal(posts.length, 1);
+  await page.close();
+});
+
+test('an OCR failure that retrying cannot fix is not hidden behind a result', async () => {
+  const { page, posts } = await openFakePortal(browser);
+  const solve = async () => { throw new Error('Reading the captcha failed: tesseract is not installed'); };
+  await assert.rejects(searchTransactionOnPage(page, 'FNHR26107623401', { solve }), /tesseract is not installed/);
+  assert.equal(posts.length, 0);
+  await page.close();
+});
+
+test('a malformed number never reaches OCR or the portal', async () => {
+  const { page, posts } = await openFakePortal(browser);
+  const ocr = fakeOcr('ABC123');
+  const result = await searchWithOcr(page, 'bad number!', 'data:image/png;base64,AAAA', { solve: ocr.solve });
+  assert.equal(result.status, 'INVALID_INPUT');
+  assert.equal(ocr.seen.length, 0);
   assert.equal(posts.length, 0);
   await page.close();
 });

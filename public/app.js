@@ -6,6 +6,7 @@ const FIELDS = [
   ['bankRefNo', 'Bank ref'], ['grn', 'GRN'], ['cin', 'CIN'], ['amount', 'Amount'], ['statusDescription', 'Bank status']
 ];
 const LABELS = { FOUND: 'Found', NOT_FOUND: 'Not found', INVALID_INPUT: 'Invalid', TIMEOUT: 'Timed out', WEBSITE_ERROR: 'Site error', CAPTCHA_REQUIRED: 'CAPTCHA' };
+const HINT = 'Up to 1000 numbers. The captcha is read for you, so a long list takes a few seconds per number.';
 const KEY_NAME = 'parivahan-access-key';
 const store = {
   get: () => { try { return localStorage.getItem(KEY_NAME) || ''; } catch { return ''; } },
@@ -27,11 +28,8 @@ async function api(url, options = {}) {
 }
 
 let results = [];
-let runNumbers = [];
 let running = false;
-let busy = false; // a request for this run is waiting on the portal
 let controller = null;
-let sessionId = null;
 
 function toast(text) {
   const t = $('toast');
@@ -88,6 +86,7 @@ const openCards = new Set();
 function render(numbers) {
   const ol = $('results');
   ol.textContent = '';
+  const current = numbers.findIndex((_, i) => !results[i]); // searches run one at a time, in order
   numbers.forEach((n, i) => {
     const r = results[i];
     const li = document.createElement('li');
@@ -109,7 +108,7 @@ function render(numbers) {
     }
     const chip = document.createElement('span');
     chip.className = 'chip';
-    chip.textContent = r ? (LABELS[r.status] || r.status) : (running ? (i === results.length ? (busy ? 'Searching' : 'Type captcha') : 'Waiting') : 'Not searched');
+    chip.textContent = r ? (LABELS[r.status] || r.status) : (running ? (i === current ? 'Searching' : 'Waiting') : 'Not searched');
     head.append(left, chip);
 
     if (hasData) {
@@ -154,128 +153,50 @@ function render(numbers) {
     : `${found} of ${numbers.length} found${done < numbers.length ? ` (stopped after ${done})` : ''}`;
 }
 
-// The portal asks for a captcha on every search, so a run goes one number at a time: the server holds
-// one portal session open, shows its captcha image here, and sends what you type from that same session.
-const VALID_NUMBER = /^[A-Z0-9-]{6,50}$/;
-const VALID_CAPTCHA = /^[A-Z0-9]{6}$/;
-const UNREACHABLE = 'Could not reach the local server. Check that it is running.';
-const invalidResult = (applicationNo) => ({ status: 'INVALID_INPUT', applicationNo, message: 'Must be 6-50 letters, numbers or hyphens.' });
-
-function setCaptchaError(text) {
-  $('cap-error').textContent = text || '';
-  $('cap-error').hidden = !text;
-}
-
-function lockCaptcha(locked) {
-  ['cap-input', 'cap-go', 'cap-refresh'].forEach((id) => { $(id).disabled = locked; });
-}
-
-// Shows a new image for the number being searched and gets the box ready to type in.
-function showCaptcha(image) {
-  $('captcha-card').hidden = false;
-  $('cap-number').textContent = runNumbers[results.length] || '';
-  $('cap-img').src = image;
-  $('cap-input').value = '';
-  lockCaptcha(false);
-  $('cap-input').focus();
-}
-
-// Numbers the portal would reject anyway are marked invalid without asking for a captcha.
-function skipInvalid() {
-  while (results.length < runNumbers.length && !VALID_NUMBER.test(runNumbers[results.length])) {
-    results.push(invalidResult(runNumbers[results.length]));
-  }
-}
-
-function endRun(finished) {
-  const id = sessionId;
-  sessionId = null;
-  if (id) api(`/api/captcha/session/${id}`, { method: 'DELETE' }).catch(() => {});
-  controller = null;
-  running = false;
-  busy = false;
-  $('captcha-card').hidden = true;
-  $('go').disabled = false;
-  render(runNumbers);
-  if (finished && $('auto').value !== 'off') exportAs('xlsx', $('auto').value);
-}
-
-// Opens a portal session and shows its first captcha. Throws with a message fit to show the person.
-async function openSession() {
-  const res = await api('/api/captcha/session', { method: 'POST', signal: controller.signal });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.message || 'Could not open the portal. Try again.');
-  sessionId = body.sessionId;
-  showCaptcha(body.captcha);
-}
-
-// Runs fn while the captcha box is locked. A Stop during the request is not an error.
-async function whileBusy(fn) {
-  busy = true;
-  lockCaptcha(true);
-  render(runNumbers);
-  try {
-    await fn();
-  } catch (error) {
-    if (!(error && error.name === 'AbortError')) setCaptchaError(error instanceof TypeError ? UNREACHABLE : error.message);
-  } finally {
-    busy = false;
-    if (running) {
-      lockCaptcha(false);
-      render(runNumbers);
-    }
-  }
-}
-
-// The session timed out on the server (or the portal let go of it): start over with a new one.
-async function restartSession() {
-  await openSession();
-  setCaptchaError('The captcha session timed out. Type the new captcha.');
-}
-
-function reloadCaptcha() {
-  if (!running || busy) return;
-  setCaptchaError('');
-  return whileBusy(async () => {
-    const res = await api(`/api/captcha/session/${sessionId}/refresh`, { method: 'POST', signal: controller.signal });
-    if (res.status === 404) return restartSession();
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.message || 'Could not load a new captcha. Try again.');
-    showCaptcha(body.captcha);
+// The server reads the portal's captcha itself, one number at a time, and streams back a JSON line
+// per finished search. A single request keeps the browser well under its per-host connection limit.
+// Returns false if stopped.
+async function searchAll(numbers, signal) {
+  const failRemaining = (message) => numbers.forEach((n, i) => {
+    if (!results[i]) results[i] = { status: 'WEBSITE_ERROR', applicationNo: n, message };
   });
-}
-
-function submitCaptcha() {
-  if (!running || busy) return;
-  const code = $('cap-input').value.trim().toUpperCase();
-  if (!VALID_CAPTCHA.test(code)) return setCaptchaError('Type the 6 letters or digits shown in the image.');
-  setCaptchaError('');
-  const number = runNumbers[results.length];
-  const hasNext = runNumbers.slice(results.length + 1).some((n) => VALID_NUMBER.test(n));
-  return whileBusy(async () => {
-    const res = await api(`/api/captcha/session/${sessionId}/search`, {
+  try {
+    const res = await api('/api/transaction/search-stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ applicationNo: number, captcha: code, next: hasNext }),
-      signal: controller.signal
+      body: JSON.stringify({ applicationNos: numbers }),
+      signal
     });
-    if (res.status === 404) return restartSession();
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok || !body.result) throw new Error(body.message || 'The search failed. Try again.');
-    if (!running) return; // Stop was pressed
-
-    if (body.result.status === 'CAPTCHA_WRONG') {
-      if (body.captcha) showCaptcha(body.captcha);
-      setCaptchaError('The captcha was not accepted. Type the new one.');
-      return;
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      failRemaining(body.message || 'The server could not process the request.');
+      return true;
     }
-    results.push(body.result);
-    skipInvalid();
-    if (results.length >= runNumbers.length) return endRun(true);
-    if (body.captcha) return showCaptcha(body.captcha);
-    // The answer arrived but the portal gave no new image: ask for one.
-    setCaptchaError('Press the refresh button to load the next captcha.');
-  });
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffered = '';
+    const take = (line) => {
+      if (!line.trim()) return;
+      const { index, result } = JSON.parse(line);
+      results[index] = result;
+      render(numbers);
+    };
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffered += decoder.decode(value, { stream: true });
+      const lines = buffered.split('\n');
+      buffered = lines.pop();
+      lines.forEach(take);
+    }
+    take(buffered);
+    failRemaining('The server stopped before returning this result.');
+    return true;
+  } catch (error) {
+    if (error && error.name === 'AbortError') return false;
+    failRemaining('Could not reach the local server. Check that it is running.');
+    return true;
+  }
 }
 
 $('form').addEventListener('submit', async (e) => {
@@ -304,40 +225,26 @@ $('form').addEventListener('submit', async (e) => {
     hint.className = 'hint err';
     return;
   }
-  hint.textContent = 'Up to 1000 numbers. The portal asks for a captcha on every search, so you type one for each number.';
+  hint.textContent = HINT;
   hint.className = 'hint';
   results = [];
-  runNumbers = numbers;
   openCards.clear();
   running = true;
-  busy = false;
-  controller = new AbortController();
   $('go').disabled = true;
   $('results-wrap').hidden = false;
-  setCaptchaError('');
-  skipInvalid();
-  if (results.length >= numbers.length) return endRun(true);
   render(numbers);
-  try {
-    await openSession();
-  } catch (error) {
-    if (error && error.name === 'AbortError') return;
-    hint.textContent = error instanceof TypeError ? UNREACHABLE : error.message;
-    hint.className = 'hint err';
-    endRun(false);
-  }
+  controller = new AbortController();
+  const { signal } = controller;
+  const finished = await searchAll(numbers, signal);
+  controller = null;
+  running = false;
+  $('go').disabled = false;
+  render(numbers);
+  if (finished && $('auto').value !== 'off') exportAs('xlsx', $('auto').value);
 });
-
-$('captcha-card').addEventListener('submit', (e) => {
-  e.preventDefault();
-  submitCaptcha();
-});
-$('cap-refresh').addEventListener('click', reloadCaptcha);
-$('cap-input').addEventListener('input', (e) => { e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''); });
 
 $('stop').addEventListener('click', () => {
   if (controller) controller.abort();
-  endRun(false);
   toast('Stopped. Results so far are kept.');
 });
 

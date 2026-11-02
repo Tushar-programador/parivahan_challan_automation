@@ -127,8 +127,8 @@ async function processBulk(applicationNumbers, options = {}) {
         };
       results.push(normalizeBulkResult(result, submittedValue));
 
-      // A CAPTCHA_REQUIRED answer never touched the portal, so there is nothing to go easy on.
-      if (index < applicationNumbers.length - 1 && delayMs > 0 && result.status !== 'CAPTCHA_REQUIRED') {
+      // An invalid number never touched the portal, so there is nothing to go easy on.
+      if (index < applicationNumbers.length - 1 && delayMs > 0 && result.status !== 'INVALID_INPUT') {
         await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
     }

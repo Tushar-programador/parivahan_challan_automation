@@ -49,14 +49,7 @@ test('reports any other portal message as a site error, and never guesses not fo
   assert.equal(classifyMessage(''), 'WEBSITE_ERROR');
 });
 
-test('a search with no captcha step answers CAPTCHA_REQUIRED without opening a browser', async () => {
-  const result = await searchTransaction('fnhr26107623401');
-  assert.equal(result.status, 'CAPTCHA_REQUIRED');
-  assert.equal(result.applicationNo, 'FNHR26107623401');
-  assert.match(result.message, /web UI/i);
-});
-
-test('a search with no captcha step still rejects a malformed number first', async () => {
+test('a malformed number is rejected before a browser or captcha is involved', async () => {
   const result = await searchTransaction('bad number!');
   assert.equal(result.status, 'INVALID_INPUT');
 });

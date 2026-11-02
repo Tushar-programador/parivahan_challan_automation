@@ -1,4 +1,6 @@
 const { chromium } = require('playwright');
+const { createLimiter } = require('./limiter');
+const { readCaptchaText } = require('./ocr');
 
 const TRANSACTION_STATUS_URL = 'https://vahan.parivahan.gov.in/eTransPgi/transactionStatus';
 const VALID_INPUT = /^[A-Za-z0-9-]+$/;
@@ -94,6 +96,11 @@ const PAGE_TIMEOUT_MS = 30000;
 const RESULT_TIMEOUT_MS =  20000;
 const CAPTCHA_WAIT_MS = 5000;
 const LOAD_ATTEMPTS = 3;
+// Images read per number before giving up: each wrong or unreadable code costs a fresh image from the portal.
+const MAX_CAPTCHA_ATTEMPTS = 5;
+// Searches that run at once (default 1, to go easy on the government site).
+const SEARCH_CONCURRENCY = Number.parseInt(process.env.SEARCH_CONCURRENCY, 10) || 1;
+const limit = createLimiter(SEARCH_CONCURRENCY);
 // Container-friendly flags: no sandbox (runs as root), and /tmp instead of the small /dev/shm.
 const LAUNCH_OPTIONS = { headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] };
 
@@ -107,10 +114,10 @@ const invalidResult = (applicationNo) => ({
   message: 'Application/Challan number must contain 6-50 letters, numbers, or hyphens.'
 });
 
-const captchaRequiredResult = (applicationNo) => ({
+const captchaRequiredResult = (applicationNo, attempts) => ({
   status: 'CAPTCHA_REQUIRED',
   applicationNo,
-  message: 'The portal asks for a CAPTCHA on every search. Use the web UI (npm start) or the userscript and type it.'
+  message: `The captcha could not be read after ${attempts} tries. Search this number again, or use the userscript and type it.`
 });
 
 async function loadSearchPage(page) {
@@ -265,15 +272,64 @@ async function openSearchPage() {
   return page;
 }
 
-// Unattended searches (CLI, bulk upload) have nobody to type the captcha, so they say so at once.
-async function searchTransactionOnPage(_page, applicationNo) {
+// Searches from a page already showing the form and the captcha image `image`. Each image is read with
+// OCR; when the code cannot be read or the portal rejects it, a new image is loaded and tried, up to
+// `attempts` images. `solve` is overridable for tests.
+async function searchWithOcr(page, applicationNo, image, { solve = readCaptchaText, attempts = MAX_CAPTCHA_ATTEMPTS } = {}) {
   const cleanApplicationNo = normalizeApplicationNumber(applicationNo);
   if (!isValidApplicationNumber(cleanApplicationNo)) return invalidResult(cleanApplicationNo);
-  return captchaRequiredResult(cleanApplicationNo);
+
+  let captcha = image;
+  for (let attempt = 1; ; attempt += 1) {
+    const code = await solve(captcha);
+    let rejected = null;
+    if (isValidCaptcha(code)) {
+      const result = await searchWithCaptcha(page, cleanApplicationNo, code);
+      if (result.status !== 'CAPTCHA_WRONG') return result;
+      rejected = result;
+    }
+    log(`Captcha ${rejected ? `${code} rejected` : 'not readable'} for ${cleanApplicationNo} (image ${attempt}/${attempts})`);
+    if (attempt >= attempts) return captchaRequiredResult(cleanApplicationNo, attempts);
+
+    try {
+      captcha = rejected ? await nextCaptcha(page, rejected) : await refreshCaptcha(page);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { status: 'WEBSITE_ERROR', applicationNo: cleanApplicationNo, message: `Could not load a new captcha: ${message}` };
+    }
+  }
 }
 
-function searchTransaction(applicationNo) {
-  return searchTransactionOnPage(null, applicationNo);
+// One complete search on `page`: opens the form, reads the captcha and searches, with no one to type anything.
+async function searchTransactionOnPage(page, applicationNo, options) {
+  const cleanApplicationNo = normalizeApplicationNumber(applicationNo);
+  if (!isValidApplicationNumber(cleanApplicationNo)) return invalidResult(cleanApplicationNo);
+
+  let image;
+  try {
+    image = await prepareSearchForm(page);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { status: 'WEBSITE_ERROR', applicationNo: cleanApplicationNo, message: `Could not open the portal: ${message}` };
+  }
+  return searchWithOcr(page, cleanApplicationNo, image, options);
+}
+
+// Up to SEARCH_CONCURRENCY searches run at once. `options.cancelled()` turns a search that has not
+// started yet into CANCELLED, so a closed browser tab does not leave the rest of a long list running.
+function searchTransaction(applicationNo, options = {}) {
+  const cleanApplicationNo = normalizeApplicationNumber(applicationNo);
+  if (!isValidApplicationNumber(cleanApplicationNo)) return Promise.resolve(invalidResult(cleanApplicationNo));
+
+  return limit(async () => {
+    if (options.cancelled && options.cancelled()) return { status: 'CANCELLED', applicationNo: cleanApplicationNo };
+    const page = await openSearchPage();
+    try {
+      return await searchTransactionOnPage(page, cleanApplicationNo, options);
+    } finally {
+      await page.close().catch(() => {});
+    }
+  });
 }
 
 async function closeBrowser() {
@@ -298,5 +354,7 @@ module.exports = {
   refreshCaptcha,
   nextCaptcha,
   searchWithCaptcha,
+  searchWithOcr,
+  MAX_CAPTCHA_ATTEMPTS,
   TRANSACTION_STATUS_URL
 };
