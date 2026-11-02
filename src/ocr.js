@@ -23,7 +23,7 @@ function run(python, script, imagePath) {
 }
 
 // Reads the code in a captcha image (a PNG data URL) with src/ocr.py. Resolves to the code, or null when
-// the image gave no 6-character read. Rejects when OCR itself cannot run (no Python, Tesseract or Pillow),
+// the image gave no 6-character read. Rejects when OCR itself cannot run (no Python or ddddocr),
 // which retrying with another image would not fix. `python` and `script` are overridable for tests.
 async function readCaptchaText(dataUrl, { python = PYTHON, script = SCRIPT } = {}) {
   const png = decodePngDataUrl(dataUrl);
@@ -37,4 +37,4 @@ async function readCaptchaText(dataUrl, { python = PYTHON, script = SCRIPT } = {
   }
 }
 
-module.exports = { readCaptchaText };
+module.exports = { readCaptchaText, PYTHON, SCRIPT };

@@ -1,70 +1,57 @@
-import shutil
+"""Reads the code in a Parivahan captcha image: python ocr.py <image_path>
+
+Prints the 6 characters. Exits with NO_READ_EXIT when the image gives no 6-character read, and with
+1 or 2 when OCR itself cannot run, so src/ocr.js can tell a hard-to-read image from a broken setup.
+"""
+import contextlib
+import re
 import sys
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 
-import pytesseract
-from PIL import Image, ImageChops, ImageOps
-
-DEFAULT_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-ALLOWED_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 CAPTCHA_LEN = 6
-DARK_THRESHOLDS = (50, 70, 90, 110, 130)
-PSMS = (7, 8, 13)
-# Each read starts its own tesseract process (about a second on Windows), so run them side by side.
-WORKERS = 8
-# Exit status for "the image has no 6-character read". Any other failure (missing Tesseract, bad
-# image) exits with 1 or 2, so src/ocr.js can tell a hard-to-read captcha from a broken setup.
 NO_READ_EXIT = 3
+CODE = re.compile(rf"[A-Z0-9]{{{CAPTCHA_LEN}}}")
 
-if not shutil.which("tesseract"):
-    pytesseract.pytesseract.tesseract_cmd = DEFAULT_TESSERACT
+# ddddocr prints while it loads; stdout is kept for the answer alone.
+try:
+    with contextlib.redirect_stdout(sys.stderr):
+        import ddddocr
+except ImportError:
+    print("ddddocr is not installed. Run: pip install ddddocr", file=sys.stderr)
+    sys.exit(1)
 
-
-def preprocess(path, threshold):
-    # captcha glyphs are near-black, the noise lines are coloured/lighter: keep only
-    # near-black pixels, add a white margin (edge chars get dropped), then upscale
-    r, g, b = Image.open(path).convert("RGB").split()
-    darkest = ImageChops.lighter(ImageChops.lighter(r, g), b)  # per-pixel max channel
-    img = darkest.point([0 if v < threshold else 255 for v in range(256)])
-    img = ImageOps.expand(img, border=10, fill=255)
-    return img.resize((img.width * 4, img.height * 4), Image.Resampling.LANCZOS)
+_reader = None
 
 
-def read(job):
-    img, psm = job
-    config = f"--psm {psm} -c tessedit_char_whitelist={ALLOWED_CHARS}"
-    # the portal takes the code in capitals, so 'a' and 'A' are the same vote
-    return pytesseract.image_to_string(img, config=config).strip().upper()
+def reader():
+    global _reader
+    if _reader is None:
+        with contextlib.redirect_stdout(sys.stderr):
+            _reader = ddddocr.DdddOcr(show_ad=False)
+    return _reader
 
 
 def solve(path):
-    """Try every threshold/psm combo; vote among reads that are CAPTCHA_LEN long."""
-    jobs = [(preprocess(path, threshold), psm) for threshold in DARK_THRESHOLDS for psm in PSMS]
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        reads = [text for text in pool.map(read, jobs) if text]  # map keeps job order, so ties vote the same way
+    """The code in the image, or None when the read is not exactly CAPTCHA_LEN letters/digits.
 
-    valid = Counter(t for t in reads if len(t) == CAPTCHA_LEN)
-    if valid:
-        return valid.most_common(1)[0][0], reads
-    return None, reads
+    The portal clips the last letter of some images at the right edge, and the model then answers with
+    5 characters. On 42 hand-labelled images every 6-character read was right and every miss was short,
+    so a wrong length is the signal to ask for a new image instead of submitting a guess.
+    """
+    with open(path, "rb") as image:
+        text = str(reader().classification(image.read())).strip().upper()
+    return text if CODE.fullmatch(text) else None
 
 
 def main():
     if len(sys.argv) < 2:
-        print("usage: python ocr.py <image_path> [--debug]", file=sys.stderr)
+        print("usage: python ocr.py <image_path>", file=sys.stderr)
         sys.exit(2)
 
-    path = sys.argv[1]
-
-    text, reads = solve(path)
-    if text is None:
-        print(f"no {CAPTCHA_LEN}-char read, got: {Counter(reads).most_common()}", file=sys.stderr)
+    code = solve(sys.argv[1])
+    if code is None:
+        print(f"no {CAPTCHA_LEN}-character read", file=sys.stderr)
         sys.exit(NO_READ_EXIT)
-
-    print(text)
-    if "--debug" in sys.argv:
-        print(Counter(reads).most_common(), file=sys.stderr)
+    print(code)
 
 
 if __name__ == "__main__":
