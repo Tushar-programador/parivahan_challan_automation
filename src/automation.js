@@ -100,7 +100,7 @@ const LOAD_ATTEMPTS = 3;
 // Images read per number before giving up: each wrong or unreadable code costs a fresh image from the portal.
 const MAX_CAPTCHA_ATTEMPTS = 5;
 // Searches that run at once (default 1, to go easy on the government site).
-const SEARCH_CONCURRENCY = Number.parseInt(process.env.SEARCH_CONCURRENCY, 10) || 5;
+const SEARCH_CONCURRENCY = Number.parseInt(process.env.SEARCH_CONCURRENCY, 10) || 15;
 const limit = createLimiter(SEARCH_CONCURRENCY);
 const pool = createPagePool();
 // Container-friendly flags: no sandbox (runs as root), and /tmp instead of the small /dev/shm.
