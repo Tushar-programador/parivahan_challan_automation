@@ -7,6 +7,7 @@
     "start": "node src/server.js",
     "search": "node src/cli.js",
     "bulk": "node src/bulk-cli.js",
+    "user": "node src/user-cli.js",
     "test": "node --test",
     "service:install": "node service/install.js",
     "service:uninstall": "node service/uninstall.js"
@@ -15,13 +16,16 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "cookie-parser": "^1.4.7",
     "csv-parse": "^7.0.3",
     "exceljs": "^4.4.0",
     "express": "^5.2.1",
     "multer": "^2.4.0",
+    "pg": "^8.23.1",
     "playwright": "^1.63.0"
   },
   "devDependencies": {
-    "node-windows": "^1.0.0-beta.8"
+    "node-windows": "^1.0.0-beta.8",
+    "pg-mem": "^3.0.14"
   }
 }
