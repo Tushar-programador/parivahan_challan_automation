@@ -21,4 +21,24 @@ async function startTestApp(deps = {}) {
   };
 }
 
-module.exports = { startTestApp };
+// A database pool for tests. By default an in-memory pg-mem database, so tests need no server.
+// With TEST_DATABASE_URL set it is real Postgres instead, and the public schema is wiped first.
+// pg-mem is required lazily: this file is also run by `node --test` and must do nothing when loaded.
+async function createTestPool({ migrate = true } = {}) {
+  const { migrate: applyMigrations } = require('../../src/db'); // also registers the int8 -> number parser
+  let pool;
+  if (process.env.TEST_DATABASE_URL) {
+    const { Pool } = require('pg');
+    pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await pool.query('drop schema public cascade');
+    await pool.query('create schema public');
+  } else {
+    const { newDb } = require('pg-mem');
+    const { Pool } = newDb().adapters.createPg();
+    pool = new Pool();
+  }
+  if (migrate) await applyMigrations(pool);
+  return pool;
+}
+
+module.exports = { startTestApp, createTestPool };
