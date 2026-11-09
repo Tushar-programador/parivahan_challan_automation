@@ -1,8 +1,9 @@
 const path = require('path');
-const crypto = require('crypto');
 const express = require('express');
+const cookieParser = require('cookie-parser');
 const multer = require('multer');
 const { createSessionStore, SessionError } = require('./sessions');
+const { authRouter, requireAuth, sameOrigin } = require('./auth');
 const { saveCaptchaImage } = require('./captcha-images');
 const { runBatch } = require('./stream');
 const {
@@ -18,25 +19,29 @@ const SESSION_ERROR_STATUS = { NOT_FOUND: 404, BUSY: 409, TOO_MANY: 429 };
 
 // Builds the Express app without listening on a port, so tests can start it on any port.
 // Routes read functions off `automation` at request time, so a test may pass a partial object.
-function createApp({ automation = require('./automation'), accessKey = process.env.ACCESS_KEY || '' } = {}) {
-  // Optional shared key for /api. Set ACCESS_KEY when the service is reachable from the internet.
-  function requireAccessKey(req, res, next) {
-    if (!accessKey) return next();
-    const given = Buffer.from(String(req.get('x-access-key') || ''));
-    const wanted = Buffer.from(accessKey);
-    if (given.length === wanted.length && crypto.timingSafeEqual(given, wanted)) return next();
-    return res.status(401).json({ status: 'UNAUTHORIZED', message: 'Enter the access key to use this service.' });
+// `users`, `sessions` (the login session store), `throttle` and `config` are required: without them there would
+// be no sign-in, so the app refuses to be built rather than serve /api to everyone.
+function createApp({ automation = require('./automation'), users, sessions, throttle, config } = {}) {
+  if (!users || !sessions || !throttle || !config) {
+    throw new Error('createApp needs users, sessions, throttle and config');
   }
 
   const app = express();
+  app.set('trust proxy', config.trustProxy);
   const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 1024 * 1024, files: 1 }
   });
 
-  app.use(express.json({ limit: '5mb' }));
+  app.use(cookieParser());
   app.use(express.static(path.join(__dirname, '..', 'public')));
-  app.use('/api', requireAccessKey);
+
+  // Everything under /api refuses a cross-origin write, and only /api/auth/* is reachable without signing in.
+  // The large JSON parser comes after the guard, so nobody unauthenticated can make the server read a big body.
+  app.use('/api', sameOrigin());
+  app.use('/api/auth', authRouter({ users, sessions, throttle, cookieSecure: config.cookieSecure }));
+  app.use('/api', requireAuth(sessions));
+  app.use(express.json({ limit: '5mb' }));
 
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok' });
@@ -96,7 +101,7 @@ function createApp({ automation = require('./automation'), accessKey = process.e
 
   // Attended searches: the portal wants a captcha for every search, so the UI shows the image from a
   // session's browser page, a person types it, and the server submits it from that same page.
-  const sessions = createSessionStore();
+  const captchaSessions = createSessionStore();
   const CAPTCHA_IMAGE_DIR = process.env.CAPTCHA_IMAGE_DIR || path.join(__dirname, '..', 'images');
 
   // Every captcha image sent to the UI is also saved to CAPTCHA_IMAGE_DIR. Best effort: a full disk or a
@@ -118,7 +123,7 @@ function createApp({ automation = require('./automation'), accessKey = process.e
 
   app.post('/api/captcha/session', async (_req, res) => {
     try {
-      const { id, value } = await sessions.create(async () => {
+      const { id, value } = await captchaSessions.create(async () => {
         const page = await automation.openSearchPage();
         try {
           return { page, value: await automation.prepareSearchForm(page) };
@@ -135,7 +140,7 @@ function createApp({ automation = require('./automation'), accessKey = process.e
 
   app.post('/api/captcha/session/:id/refresh', async (req, res) => {
     try {
-      return res.json({ captcha: keepCaptcha(await sessions.use(req.params.id, automation.refreshCaptcha)) });
+      return res.json({ captcha: keepCaptcha(await captchaSessions.use(req.params.id, automation.refreshCaptcha)) });
     } catch (error) {
       return sendSessionError(res, error);
     }
@@ -157,7 +162,7 @@ function createApp({ automation = require('./automation'), accessKey = process.e
     }
 
     try {
-      const payload = await sessions.use(req.params.id, async (page) => {
+      const payload = await captchaSessions.use(req.params.id, async (page) => {
         const result = await automation.searchWithCaptcha(page, applicationNo, captcha);
         if (next === false && result.status !== 'CAPTCHA_WRONG') return { result };
         // The search is already answered; failing to load the next image must not lose that answer.
@@ -170,7 +175,7 @@ function createApp({ automation = require('./automation'), accessKey = process.e
   });
 
   app.delete('/api/captcha/session/:id', async (req, res) => {
-    await sessions.close(req.params.id);
+    await captchaSessions.close(req.params.id);
     return res.status(204).end();
   });
 
@@ -261,7 +266,7 @@ function createApp({ automation = require('./automation'), accessKey = process.e
     });
   });
 
-  return { app, closeCaptchaSessions: () => sessions.closeAll() };
+  return { app, closeCaptchaSessions: () => captchaSessions.closeAll() };
 }
 
 module.exports = { createApp };
