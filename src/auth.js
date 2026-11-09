@@ -91,9 +91,11 @@ function createSessionStore(pool, { ttlHours = 12 } = {}) {
 // at its first failure. The limit depends on the key: keys starting `ip:` (one client address, any usernames) use
 // `maxFailuresPerIp`, keys starting `user:` (one username, any addresses) use `maxFailuresPerUsername`, every other
 // key (in practice "<address>|<username>") uses `maxFailures`.
-// The table holds at most `maxKeys` keys. When it is full, expired keys go first, then keys that are only counting
-// (oldest first), and a blocked key only when nothing else is left, so a flood of throwaway keys cannot push a
-// blocked key out and so free it. The key just recorded is never the one evicted.
+// The table holds at most `maxKeys` keys. When it is full, keys are given up in this order: expired keys; then keys
+// that are only counting, the emptiest first (lowest count / own limit, oldest first on a tie); then blocked keys,
+// oldest first. So a flood of throwaway keys (a count of 1 each) pushes out other throwaway keys, and can neither
+// free a blocked key nor make a key that is close to its limit (a username at 24 of 25) forget its count.
+// The key just recorded is never the one evicted.
 function createLoginThrottle({
   maxFailures = MAX_FAILURES,
   windowMs = THROTTLE_WINDOW_MS,
@@ -126,11 +128,20 @@ function createLoginThrottle({
     for (const [key, entry] of entries) {
       if (entry.windowEndsAt <= time) entries.delete(key);
     }
-    for (const evictBlocked of [false, true]) {
+    while (entries.size > maxKeys) {
+      let victim;
+      let victimScore;
       for (const [key, entry] of entries) {
-        if (entries.size <= maxKeys) return;
-        if (key !== newKey && (entry.count >= limitFor(key)) === evictBlocked) entries.delete(key);
+        if (key === newKey) continue;
+        const limit = limitFor(key);
+        const score = entry.count >= limit ? Infinity : entry.count / limit; // a blocked key ranks last
+        if (victim === undefined || score < victimScore) { // strictly lower only, so on a tie the oldest stays the victim
+          victim = key;
+          victimScore = score;
+        }
       }
+      if (victim === undefined) return;
+      entries.delete(victim);
     }
   }
 
@@ -189,13 +200,24 @@ function ipv6Groups(address) {
   return [...first, ...new Array(gap).fill('0'), ...last].map((group) => parseInt(group, 16));
 }
 
+// A proxy may append the client's source port to the address it forwards ("1.2.3.4:5678", "[2001:db8::1]:443").
+// The port says nothing about who the client is, so it is dropped (as are the brackets) before the address is keyed.
+function withoutPort(ip) {
+  const ipv4 = ip.match(/^(\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}$/);
+  if (ipv4) return ipv4[1];
+  const ipv6 = ip.match(/^\[([^\]]*)\](?::\d{1,5})?$/);
+  if (ipv6 && net.isIPv6(ipv6[1])) return ipv6[1]; // brackets belong to IPv6 only
+  return ip;
+}
+
 // The part of a client address that identifies one client for throttling. An IPv4 address stands for itself. An
 // IPv4-mapped IPv6 address (::ffff:a.b.c.d) is the same client as that IPv4 address. Any other IPv6 address is keyed by
 // its /64, because one subscriber usually controls a whole /64 and could otherwise rotate through billions of
 // addresses. Anything that is not an IP address at all shares the one key "unknown", so inventing values (for example
 // in a forwarded header that is trusted too widely) never yields a fresh set of attempts.
-function clientAddressKey(ip) {
-  if (typeof ip !== 'string') return 'unknown';
+function clientAddressKey(forwarded) {
+  if (typeof forwarded !== 'string') return 'unknown';
+  const ip = withoutPort(forwarded);
   if (net.isIPv4(ip)) return ip;
   if (!net.isIPv6(ip)) return 'unknown';
   const groups = ipv6Groups(ip);

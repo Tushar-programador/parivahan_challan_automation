@@ -358,6 +358,47 @@ withApp('addresses in the same IPv6 /64 share one failure counter', { config: { 
   assert.equal((await login(t, 'alice', PASSWORD, { 'x-forwarded-for': '2001:db8:1:3::1' })).status, 200);
 });
 
+// The attack on the username limit: guess, then flood the table with throwaway keys from many /64s so the username's
+// count is pushed out, and guess again. The table is tiny here so the flood is large relative to it.
+withApp('flooding the key table from many addresses does not reset a username\'s failure count', {
+  config: { trustProxy: 1 },
+  throttle: createLoginThrottle({ maxKeys: 40 })
+}, async (t) => {
+  const forwarded = (ip) => ({ 'x-forwarded-for': ip });
+  let accepted = 0; // wrong guesses at alice that were let through to the password check
+  let refused = 0;
+  for (let round = 0; round < 6; round += 1) {
+    const guesses = await Promise.all(Array.from({ length: 10 }, (_, i) => login(t, 'alice', 'wrong-password-1', forwarded(`10.${round}.0.${i + 1}`))));
+    for (const response of guesses) {
+      if (response.status === 401) accepted += 1;
+      else if (response.status === 429) refused += 1;
+      else assert.fail(`unexpected status ${response.status}`);
+    }
+    // 60 throwaway logins from 60 other /64s, each a new username with a non-string password (a plain failure with no
+    // hashing), so each charges three fresh keys: far more than the table holds.
+    const flood = await Promise.all(Array.from({ length: 60 }, (_, i) => postJson(`${t.baseUrl}/api/auth/login`, { username: `junk-${round}-${i}`, password: 1 }, forwarded(`2001:db8:${round}:${i}::1`))));
+    assert.ok(flood.every((response) => response.status === 401));
+  }
+  assert.equal(accepted, 25, `${accepted} guesses at alice were let through in one window, against a limit of 25`);
+  assert.equal(refused, 35);
+  const blocked = await login(t, 'alice', PASSWORD, forwarded('10.9.9.9'));
+  assert.equal(blocked.status, 429);
+});
+
+// A proxy may append the client's source port to X-Forwarded-For ("1.2.3.4:5678", "[2001:db8::1]:443").
+withApp('addresses forwarded with a port are told apart, and a client changing port does not get fresh attempts', { config: { trustProxy: 1 }, users: [['alice', PASSWORD]] }, async (t) => {
+  const junkFrom = (forwarded, n) => postJson(`${t.baseUrl}/api/auth/login`, { username: `junk-${n}`, password: 1 }, { 'x-forwarded-for': forwarded });
+  for (let i = 0; i < 50; i += 1) {
+    assert.equal((await junkFrom(`198.51.100.1:${40000 + i}`, i)).status, 401); // 50 failures, a different port each time
+  }
+  // Same address, new port: still that client, and it is over its limit.
+  const blocked = await login(t, 'alice', PASSWORD, { 'x-forwarded-for': '198.51.100.1:55555' });
+  assert.equal(blocked.status, 429);
+  // A different address is a different client, whether or not it carries a port.
+  assert.equal((await login(t, 'alice', PASSWORD, { 'x-forwarded-for': '198.51.100.2:40000' })).status, 200);
+  assert.equal((await login(t, 'alice', PASSWORD, { 'x-forwarded-for': '[2001:db8::7]:443' })).status, 200);
+});
+
 // ---------- the credential a session is bound to ----------
 
 withApp('a login that already verified the password cannot open a session after the password was changed', {}, async (t) => {
@@ -845,6 +886,88 @@ test('when only blocked keys are left to evict the oldest goes, and the key just
   assert.equal(crowded.blocked('b3'), true);
 });
 
+test('keys are evicted by fill ratio: a junk key goes before a nearly full one, and counting keys go before blocked ones', () => {
+  const alive = (throttle, key) => throttle.retryAfterSeconds(key) > 0;
+  // Limits here: 5 for plain keys, 50 for ip: keys, 25 for user: keys.
+  const throttle = createLoginThrottle({ maxKeys: 4 });
+  for (let i = 0; i < 5; i += 1) throttle.fail('blocked-old'); // blocked, and the oldest key
+  for (let i = 0; i < 20; i += 1) throttle.fail('user:alice'); // 20/25 = 0.8
+  for (let i = 0; i < 2; i += 1) throttle.fail('1.2.3.4|bob'); // 2/5 = 0.4
+  for (let i = 0; i < 10; i += 1) throttle.fail('ip:1.2.3.4'); // 10/50 = 0.2
+  assert.equal(throttle.size(), 4);
+
+  throttle.fail('junk-1'); // 1/5 = 0.2 would tie with ip:1.2.3.4, but is the key just recorded
+  assert.equal(throttle.size(), 4);
+  assert.equal(alive(throttle, 'ip:1.2.3.4'), false, 'the lowest ratio of the others goes first');
+  for (const key of ['blocked-old', 'user:alice', '1.2.3.4|bob', 'junk-1']) assert.equal(alive(throttle, key), true, key);
+
+  throttle.fail('junk-2'); // junk-1 (0.2) is now the lowest, however recent
+  assert.equal(alive(throttle, 'junk-1'), false);
+  throttle.fail('junk-3');
+  assert.equal(alive(throttle, 'junk-2'), false);
+  throttle.fail('junk-4');
+  assert.equal(alive(throttle, 'junk-3'), false);
+  // the 0.4 key follows only when a lower one is not around, and the 0.8 key after it
+  for (const key of ['blocked-old', 'user:alice', '1.2.3.4|bob', 'junk-4']) assert.equal(alive(throttle, key), true, key);
+  assert.equal(throttle.size(), 4);
+
+  // Equal ratios: the oldest goes first.
+  const ties = createLoginThrottle({ maxKeys: 3 });
+  ties.fail('t1');
+  ties.fail('t2');
+  ties.fail('t3');
+  ties.fail('t4');
+  assert.equal(alive(ties, 't1'), false);
+  for (const key of ['t2', 't3', 't4']) assert.equal(alive(ties, key), true, key);
+
+  // Blocked keys are the last resort, oldest first, and a counting key (even a newer, emptier one) is given up first.
+  const last = createLoginThrottle({ maxKeys: 3, maxFailures: 2 });
+  for (const key of ['b1', 'b2']) {
+    last.fail(key);
+    last.fail(key);
+  }
+  last.fail('counting');
+  assert.equal(alive(last, 'counting'), true);
+  last.fail('newest'); // counting goes, both blocked keys stay
+  assert.equal(alive(last, 'counting'), false);
+  assert.equal(last.blocked('b1'), true);
+  assert.equal(last.blocked('b2'), true);
+  last.fail('b3'); // recording b3 pushes out the other counting key, 'newest'
+  last.fail('b3'); // and now b3 is blocked too
+  assert.equal(alive(last, 'newest'), false);
+  last.fail('last-in'); // only blocked keys left besides the new one: the oldest blocked goes
+  assert.equal(last.blocked('b1'), false);
+  assert.equal(alive(last, 'b1'), false);
+  assert.equal(last.blocked('b2'), true);
+  assert.equal(last.blocked('b3'), true);
+  assert.equal(alive(last, 'last-in'), true);
+  assert.equal(last.size(), 3);
+});
+
+test('a username key at 24 of 25 survives a flood of fresh junk keys from many addresses', () => {
+  // Small table, so the flood is far larger than it: 10,001 junk logins, each charging three fresh keys.
+  const throttle = createLoginThrottle({ maxKeys: 100 });
+  for (let i = 0; i < 24; i += 1) throttle.fail('user:alice');
+  assert.equal(throttle.blocked('user:alice'), false);
+  for (let i = 0; i < 10001; i += 1) {
+    const address = `2001:db8:${(i >> 8).toString(16)}:${(i & 255).toString(16)}::/64`;
+    throttle.fail(`${address}|junk${i}`);
+    throttle.fail(`ip:${address}`);
+    throttle.fail(`user:junk${i}`);
+  }
+  assert.ok(throttle.size() <= 100, `size was ${throttle.size()}`);
+  throttle.fail('user:alice'); // the 25th failure: still counted on top of the 24 if the key survived
+  assert.equal(throttle.blocked('user:alice'), true, 'the 24 earlier failures were forgotten');
+
+  // The same on a table of the default size, filled well past its limit.
+  const big = createLoginThrottle();
+  for (let i = 0; i < 24; i += 1) big.fail('user:alice');
+  for (let i = 0; i < 10100; i += 1) big.fail(['ip:', 'user:', '203.0.113.9|'][i % 3] + `junk${i}`);
+  assert.ok(big.size() <= 10000, `size was ${big.size()}`);
+  big.fail('user:alice');
+  assert.equal(big.blocked('user:alice'), true, 'the 24 earlier failures were forgotten');
+});
+
 test('the login throttle does not grow without bound', () => {
   let now = 0;
   const throttle = createLoginThrottle({ windowMs: 1000, now: () => now });
@@ -885,6 +1008,30 @@ test('clientAddressKey keys IPv4 by address, IPv4-mapped IPv6 by its IPv4 addres
   // Anything that is not an address shares one key, so inventing values does not give a fresh set of attempts.
   for (const junk of [undefined, null, '', 'not an ip', '999.1.1.1', '1.2.3', '2001:db8::zz', 42, {}, 'x'.repeat(5000)]) {
     assert.equal(clientAddressKey(junk), 'unknown', String(junk).slice(0, 20));
+  }
+});
+
+test('clientAddressKey strips a port from ipv4:port and [ipv6]:port, and leaves plain addresses alone', () => {
+  // plain
+  assert.equal(clientAddressKey('1.2.3.4'), '1.2.3.4');
+  assert.equal(clientAddressKey('2001:db8::1'), '2001:db8:0:0::/64');
+  // with a port
+  assert.equal(clientAddressKey('1.2.3.4:5678'), '1.2.3.4');
+  assert.equal(clientAddressKey('1.2.3.4:1'), '1.2.3.4');
+  assert.equal(clientAddressKey('[2001:db8::1]:443'), '2001:db8:0:0::/64');
+  assert.equal(clientAddressKey('[2001:db8:1:2:aaaa:bbbb:cccc:dddd]:65535'), '2001:db8:1:2::/64');
+  assert.equal(clientAddressKey('[::ffff:203.0.113.7]:8080'), '203.0.113.7');
+  assert.equal(clientAddressKey('[::1]'), '0:0:0:0::/64'); // brackets without a port
+  // the port does not matter, the address does
+  assert.equal(clientAddressKey('1.2.3.4:80'), clientAddressKey('1.2.3.4:81'));
+  assert.equal(clientAddressKey('1.2.3.4:80'), clientAddressKey('1.2.3.4'));
+  assert.notEqual(clientAddressKey('1.2.3.4:80'), clientAddressKey('1.2.3.5:80'));
+  assert.equal(clientAddressKey('[2001:db8::1]:443'), clientAddressKey('2001:db8::2'));
+  assert.notEqual(clientAddressKey('[2001:db8::1]:443'), clientAddressKey('[2001:db8:0:1::1]:443'));
+
+  // not an address plus a port: one shared key, as for any other junk
+  for (const junk of ['1.2.3.4:', '1.2.3.4:abc', '1.2.3.4:123456', '1.2.3.4:80:80', '999.1.1.1:80', '[1.2.3.4]:80', '[2001:db8::1', '2001:db8::1]:443', '[2001:db8::1]:', '[2001:db8::zz]:443', '[]:80', ':80', '2001:db8::1:443:x']) {
+    assert.equal(clientAddressKey(junk), 'unknown', junk);
   }
 });
 
