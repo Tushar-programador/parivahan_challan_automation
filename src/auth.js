@@ -1,4 +1,5 @@
 const crypto = require('node:crypto');
+const net = require('node:net');
 const express = require('express');
 const { normalizeUsername } = require('./users');
 
@@ -6,14 +7,23 @@ const SESSION_COOKIE = 'sid';
 const TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 const MAX_PASSWORD_LENGTH = 1000; // hashing a longer password would only be a way to burn CPU
 const MAX_USERNAME_LENGTH = 100; // usernames are at most 40 characters; this also bounds the throttle key
-const MAX_THROTTLE_KEYS = 10000;
 const LOGIN_BODY_LIMIT = '10kb';
+
+// Throttle defaults: failures per window for one address+username, for one address (any usernames) and for one
+// username (any addresses), and the most keys the table may hold.
+const MAX_FAILURES = 5;
+const MAX_FAILURES_PER_IP = 50;
+const MAX_FAILURES_PER_USERNAME = 25;
+const THROTTLE_WINDOW_MS = 15 * 60 * 1000;
+const MAX_THROTTLE_KEYS = 10000;
+const IP_KEY_PREFIX = 'ip:'; // the throttle picks a key's limit from its prefix
+const USER_KEY_PREFIX = 'user:';
 
 const UNAUTHORIZED = { status: 'UNAUTHORIZED', message: 'Sign in to continue.' };
 const BAD_LOGIN = { status: 'UNAUTHORIZED', message: 'Invalid username or password.' };
 const TOO_MANY = { status: 'TOO_MANY_ATTEMPTS', message: 'Too many attempts. Try again later.' };
 const FORBIDDEN = { status: 'FORBIDDEN', message: 'This request was not allowed.' };
-const INVALID_REQUEST = { status: 'INVALID_INPUT', message: 'Invalid request.' };
+const BAD_REQUEST = { status: 'BAD_REQUEST', message: 'Invalid request.' };
 
 function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
@@ -36,16 +46,20 @@ function createSessionStore(pool, { ttlHours = 12 } = {}) {
   return {
     ttlMs,
 
-    // Resolves to { token, expiresAt }, or null when there is no active user with that id. The row is inserted only
-    // while the user is still active, so a login that already checked the password cannot open a session after the
-    // user was disabled or their password changed (both of which delete the user's sessions).
-    async create(userId) {
+    // Opens a session for a user who has just proved their password. `passwordHash` is the stored hash that
+    // users.authenticate returned for that proof. Resolves to { token, expiresAt }, or null when the user is no longer
+    // active or the password has been changed since (their stored hash is no longer that value).
+    // The check and the insert are one statement, and the user row is share-locked while it runs, so it waits for a
+    // concurrent setPassword / setActive to commit and then sees the new state. Together with the sessions those two
+    // delete, no session can outlive the credential it was opened with.
+    async create(userId, passwordHash) {
       if (!Number.isSafeInteger(userId) || userId < 1) return null;
+      if (typeof passwordHash !== 'string' || passwordHash === '') return null;
       const token = crypto.randomBytes(32).toString('hex');
       const expiresAt = new Date(Date.now() + ttlMs);
       const result = await pool.query(
-        'insert into sessions (token_hash, user_id, expires_at) select $1::text, id, $3::timestamptz from users where id = $2 and is_active = true',
-        [hashToken(token), userId, expiresAt]
+        'insert into sessions (token_hash, user_id, expires_at) select $1::text, id, $3::timestamptz from users where id = $2 and is_active = true and password_hash = $4 for share',
+        [hashToken(token), userId, expiresAt, passwordHash]
       );
       return result.rowCount === 1 ? { token, expiresAt } : null;
     },
@@ -73,11 +87,28 @@ function createSessionStore(pool, { ttlHours = 12 } = {}) {
   };
 }
 
-// Counts failed logins per key (in practice "<client address>|<username>") in memory. After `maxFailures` failures
-// the key is blocked until `windowMs` after its first failure. The table is capped so that an endless stream of
-// different usernames cannot grow it without limit: expired keys go first, then the oldest.
-function createLoginThrottle({ maxFailures = 5, windowMs = 15 * 60 * 1000, now = Date.now } = {}) {
-  const entries = new Map(); // key -> { count, windowEndsAt }
+// Counts failures per key, in memory. A key is blocked once it has `limit` failures inside the window, which starts
+// at its first failure. The limit depends on the key: keys starting `ip:` (one client address, any usernames) use
+// `maxFailuresPerIp`, keys starting `user:` (one username, any addresses) use `maxFailuresPerUsername`, every other
+// key (in practice "<address>|<username>") uses `maxFailures`.
+// The table holds at most `maxKeys` keys. When it is full, expired keys go first, then keys that are only counting
+// (oldest first), and a blocked key only when nothing else is left, so a flood of throwaway keys cannot push a
+// blocked key out and so free it. The key just recorded is never the one evicted.
+function createLoginThrottle({
+  maxFailures = MAX_FAILURES,
+  windowMs = THROTTLE_WINDOW_MS,
+  now = Date.now,
+  maxKeys = MAX_THROTTLE_KEYS,
+  maxFailuresPerIp = MAX_FAILURES_PER_IP,
+  maxFailuresPerUsername = MAX_FAILURES_PER_USERNAME
+} = {}) {
+  const entries = new Map(); // key -> { count, windowEndsAt }; a Map iterates in insertion order, so oldest first
+
+  function limitFor(key) {
+    if (key.startsWith(IP_KEY_PREFIX)) return maxFailuresPerIp;
+    if (key.startsWith(USER_KEY_PREFIX)) return maxFailuresPerUsername;
+    return maxFailures;
+  }
 
   function current(key) {
     const entry = entries.get(key);
@@ -89,22 +120,24 @@ function createLoginThrottle({ maxFailures = 5, windowMs = 15 * 60 * 1000, now =
     return entry;
   }
 
-  function makeRoom() {
-    if (entries.size <= MAX_THROTTLE_KEYS) return;
+  function makeRoom(newKey) {
+    if (entries.size <= maxKeys) return;
     const time = now();
     for (const [key, entry] of entries) {
       if (entry.windowEndsAt <= time) entries.delete(key);
     }
-    for (const key of entries.keys()) {
-      if (entries.size <= MAX_THROTTLE_KEYS) break;
-      entries.delete(key); // a Map iterates in insertion order, so this is the oldest key
+    for (const evictBlocked of [false, true]) {
+      for (const [key, entry] of entries) {
+        if (entries.size <= maxKeys) return;
+        if (key !== newKey && (entry.count >= limitFor(key)) === evictBlocked) entries.delete(key);
+      }
     }
   }
 
   return {
     blocked(key) {
       const entry = current(key);
-      return entry !== undefined && entry.count >= maxFailures;
+      return entry !== undefined && entry.count >= limitFor(key);
     },
 
     fail(key) {
@@ -113,8 +146,16 @@ function createLoginThrottle({ maxFailures = 5, windowMs = 15 * 60 * 1000, now =
         entry.count += 1;
       } else {
         entries.set(key, { count: 1, windowEndsAt: now() + windowMs });
-        makeRoom();
+        makeRoom(key);
       }
+    },
+
+    // Takes back one failure (for an attempt that was charged up front and then turned out to be a success).
+    forgive(key) {
+      const entry = current(key);
+      if (!entry) return;
+      if (entry.count <= 1) entries.delete(key);
+      else entry.count -= 1;
     },
 
     reset(key) {
@@ -131,6 +172,37 @@ function createLoginThrottle({ maxFailures = 5, windowMs = 15 * 60 * 1000, now =
       return entries.size;
     }
   };
+}
+
+// The eight 16-bit groups of a valid IPv6 address, as numbers.
+function ipv6Groups(address) {
+  let text = address.split('%')[0].toLowerCase(); // a zone id ("%eth0") is not part of the address
+  const dotted = text.match(/(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (dotted) {
+    const [a, b, c, d] = dotted.slice(1).map(Number);
+    text = `${text.slice(0, dotted.index)}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+  const [head, tail] = text.split('::');
+  const first = head ? head.split(':') : [];
+  const last = tail ? tail.split(':') : [];
+  const gap = text.includes('::') ? 8 - first.length - last.length : 0;
+  return [...first, ...new Array(gap).fill('0'), ...last].map((group) => parseInt(group, 16));
+}
+
+// The part of a client address that identifies one client for throttling. An IPv4 address stands for itself. An
+// IPv4-mapped IPv6 address (::ffff:a.b.c.d) is the same client as that IPv4 address. Any other IPv6 address is keyed by
+// its /64, because one subscriber usually controls a whole /64 and could otherwise rotate through billions of
+// addresses. Anything that is not an IP address at all shares the one key "unknown", so inventing values (for example
+// in a forwarded header that is trusted too widely) never yields a fresh set of attempts.
+function clientAddressKey(ip) {
+  if (typeof ip !== 'string') return 'unknown';
+  if (net.isIPv4(ip)) return ip;
+  if (!net.isIPv6(ip)) return 'unknown';
+  const groups = ipv6Groups(ip);
+  if (groups.slice(0, 5).every((group) => group === 0) && groups[5] === 0xffff) {
+    return `${groups[6] >> 8}.${groups[6] & 255}.${groups[7] >> 8}.${groups[7] & 255}`;
+  }
+  return `${groups.slice(0, 4).map((group) => group.toString(16)).join(':')}::/64`;
 }
 
 // Sets req.user = { id, username } for a valid `sid` cookie, otherwise answers 401. A database error is passed on
@@ -168,8 +240,20 @@ function sameOrigin() {
   };
 }
 
-function throttleKey(ip, username) {
-  return `${ip}|${normalizeUsername(username).slice(0, MAX_USERNAME_LENGTH)}`;
+// A request body the JSON parser refused (broken, too large, wrong encoding) is the caller's mistake: 4xx, with the
+// parser's status, and nothing logged. It must not reach a handler that logs errors, because the parser's error
+// carries the whole raw request body (for a login, a password).
+function bodyParserErrorHandler(error, _req, res, next) {
+  const clientError = Boolean(error) && typeof error.type === 'string' && Number.isInteger(error.status) && error.status >= 400 && error.status < 500;
+  if (!clientError || res.headersSent) return next(error);
+  return res.status(error.status).json(BAD_REQUEST);
+}
+
+// The three throttle keys one login attempt is counted under.
+function loginKeys(ip, username) {
+  const address = clientAddressKey(ip);
+  const name = normalizeUsername(username).slice(0, MAX_USERNAME_LENGTH);
+  return { pair: `${address}|${name}`, address: `${IP_KEY_PREFIX}${address}`, username: `${USER_KEY_PREFIX}${name}` };
 }
 
 function plausibleCredentials(username, password) {
@@ -191,25 +275,38 @@ function authRouter({ users, sessions, throttle, cookieSecure }) {
   router.post('/login', async (req, res, next) => {
     try {
       const { username, password } = req.body && typeof req.body === 'object' ? req.body : {};
-      const key = throttleKey(req.ip, username);
+      const keys = loginKeys(req.ip, username);
 
-      if (throttle.blocked(key)) {
-        res.set('Retry-After', String(throttle.retryAfterSeconds(key)));
+      // Blocked when this address+username, this address (whatever usernames it tries) or this username (from
+      // whatever address) has used up its failures. A blocked attempt is refused even with the right password.
+      const blocked = [keys.pair, keys.address, keys.username].filter((key) => throttle.blocked(key));
+      if (blocked.length > 0) {
+        res.set('Retry-After', String(Math.max(...blocked.map((key) => throttle.retryAfterSeconds(key)))));
         return res.status(429).json(TOO_MANY);
       }
       // Every attempt is counted before it is checked and forgiven on success, so a burst of parallel guesses cannot
-      // all slip past the limit while the first ones are still being verified.
-      throttle.fail(key);
+      // all slip past the limits while the first ones are still being verified.
+      throttle.fail(keys.pair);
+      throttle.fail(keys.address);
+      throttle.fail(keys.username);
 
       // Input that could never be a valid login is an ordinary failure, decided before any hashing or database work.
       if (!plausibleCredentials(username, password)) return res.status(401).json(BAD_LOGIN);
 
       const user = await users.authenticate(username, password);
-      const session = user ? await sessions.create(user.id) : null;
+      // The session is bound to the hash the password was just checked against; if the password was changed or the
+      // user disabled meanwhile, create answers null.
+      const session = user ? await sessions.create(user.id, user.passwordHash) : null;
       if (!session) return res.status(401).json(BAD_LOGIN);
 
-      throttle.reset(key);
+      // A success clears the failures of this address+username and of this username, but not the address's own
+      // count, so one valid account cannot be used to keep wiping an address's record of guesses. It only takes back
+      // the success's own up-front charge there, so the address counter counts failures only.
+      throttle.reset(keys.pair);
+      throttle.reset(keys.username);
+      throttle.forgive(keys.address);
       res.cookie(SESSION_COOKIE, session.token, { ...cookieOptions, maxAge: sessions.ttlMs });
+      // The body is built field by field: `user` carries the password hash, which must never leave the server.
       return res.json({ user: { id: user.id, username: user.username } });
     } catch (error) {
       return next(error);
@@ -230,17 +327,17 @@ function authRouter({ users, sessions, throttle, cookieSecure }) {
     res.json({ user: { id: req.user.id, username: req.user.username } });
   });
 
-  // A body the JSON parser refused (broken, too large, wrong encoding) is the caller's mistake. It is answered here,
-  // and never reaches the app's logging error handler, because the parser's error carries the raw request body,
-  // which for a login is a password.
-  router.use((error, _req, res, next) => {
-    if (error && Number.isInteger(error.status) && error.status >= 400 && error.status < 500) {
-      return res.status(error.status).json(INVALID_REQUEST);
-    }
-    return next(error);
-  });
+  router.use(bodyParserErrorHandler);
 
   return router;
 }
 
-module.exports = { createSessionStore, createLoginThrottle, authRouter, requireAuth, sameOrigin };
+module.exports = {
+  createSessionStore,
+  createLoginThrottle,
+  clientAddressKey,
+  authRouter,
+  requireAuth,
+  sameOrigin,
+  bodyParserErrorHandler
+};

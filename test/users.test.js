@@ -9,6 +9,9 @@ const { runUserCli } = require('../src/user-cli');
 
 const PASSWORD = 'correct-horse-1';
 
+// authenticate also hands back the stored hash (see below); most tests only care who the user is.
+const identity = (user) => user && { id: user.id, username: user.username };
+
 // Runs a test body with a fresh migrated database and a user store on it; the pool is always closed.
 function withStore(name, body) {
   test(name, async (t) => {
@@ -39,7 +42,7 @@ withStore('create trims and lowercases the username; authenticate then works wit
   assert.deepEqual(created, { id: created.id, username: 'alice.smith' });
   assert.equal(typeof created.id, 'number');
   for (const typed of ['alice.smith', 'ALICE.SMITH', '  Alice.Smith ']) {
-    assert.deepEqual(await users.authenticate(typed, PASSWORD), created, typed);
+    assert.deepEqual(identity(await users.authenticate(typed, PASSWORD)), created, typed);
   }
 });
 
@@ -66,7 +69,7 @@ withStore('create rejects a duplicate username, ignoring case, with UserError EX
   assert.ok(await users.authenticate('alice', PASSWORD), 'the first account is untouched');
 });
 
-withStore('authenticate returns null for unknown user, wrong password and inactive user', async ({ users }) => {
+withStore('authenticate returns null for unknown user, wrong password and inactive user', async ({ users, pool }) => {
   await users.create('alice', PASSWORD);
   await users.create('bob', PASSWORD);
   await users.setActive('bob', false);
@@ -78,7 +81,11 @@ withStore('authenticate returns null for unknown user, wrong password and inacti
   assert.equal(await users.authenticate(undefined, undefined), null);
   assert.equal(await users.authenticate('alice', undefined), null);
   assert.equal(await users.authenticate({ $ne: 'x' }, PASSWORD), null);
-  assert.deepEqual(Object.keys(await users.authenticate('alice', PASSWORD)).sort(), ['id', 'username']);
+  const verified = await users.authenticate('alice', PASSWORD);
+  assert.deepEqual(Object.keys(verified).sort(), ['id', 'passwordHash', 'username']);
+  // passwordHash is the stored scrypt string, so a caller can later prove the password has not changed since.
+  const { rows } = await pool.query('select password_hash from users where username = $1', ['alice']);
+  assert.equal(verified.passwordHash, rows[0].password_hash);
 });
 
 withStore('authenticate checks the password against a dummy hash when the user does not exist, so timing does not reveal usernames', async ({ users, t }) => {
@@ -126,14 +133,28 @@ withStore('setActive(true) lets the user in again; setActive and setPassword ret
   await users.setActive('alice', false);
   assert.equal(await users.authenticate('alice', PASSWORD), null);
   assert.equal(await users.setActive('  ALICE ', true), true);
-  assert.deepEqual(await users.authenticate('alice', PASSWORD), alice);
+  assert.deepEqual(identity(await users.authenticate('alice', PASSWORD)), alice);
   assert.deepEqual(await users.getById(alice.id), alice);
 
   assert.equal(await users.setActive('nobody', false), false);
   assert.equal(await users.setActive('nobody', true), false);
   assert.equal(await users.setPassword('nobody', 'brand-new-pass-1'), false);
   await assert.rejects(users.setActive('alice', 'false'), TypeError, 'a string is not a boolean');
-  assert.deepEqual(await users.authenticate('alice', PASSWORD), alice);
+  assert.deepEqual(identity(await users.authenticate('alice', PASSWORD)), alice);
+});
+
+withStore("setActive(true) also deletes the user's sessions, so one opened while the user was disabled cannot come back to life", async ({ users, pool }) => {
+  const alice = await users.create('alice', PASSWORD);
+  const bob = await users.create('bob', PASSWORD);
+  await users.setActive('alice', false);
+  await addSession(pool, alice.id, 'alice-late'); // a login that raced the disabling: inserted between its DELETE and its COMMIT
+  await addSession(pool, bob.id, 'bob-1');
+  assert.equal(await sessionCount(pool, alice.id), 1);
+
+  assert.equal(await users.setActive('alice', true), true);
+
+  assert.equal(await sessionCount(pool, alice.id), 0);
+  assert.equal(await sessionCount(pool, bob.id), 1, 'other users keep their sessions');
 });
 
 withStore('setPassword revokes sessions; the old password fails, the new one works', async ({ users, pool }) => {
@@ -147,15 +168,15 @@ withStore('setPassword revokes sessions; the old password fails, the new one wor
   assert.equal(await sessionCount(pool, alice.id), 0);
   assert.equal(await sessionCount(pool, bob.id), 1);
   assert.equal(await users.authenticate('alice', PASSWORD), null);
-  assert.deepEqual(await users.authenticate('alice', 'brand-new-pass-1'), alice);
-  assert.deepEqual(await users.authenticate('bob', PASSWORD), bob, 'other users are unaffected');
+  assert.deepEqual(identity(await users.authenticate('alice', 'brand-new-pass-1')), alice);
+  assert.deepEqual(identity(await users.authenticate('bob', PASSWORD)), bob, 'other users are unaffected');
 });
 
 withStore('setPassword with a short password throws INVALID and changes nothing', async ({ users, pool }) => {
   const alice = await users.create('alice', PASSWORD);
   await addSession(pool, alice.id, 'alice-1');
   await assert.rejects(users.setPassword('alice', 'short'), (error) => error instanceof UserError && error.code === 'INVALID');
-  assert.deepEqual(await users.authenticate('alice', PASSWORD), alice);
+  assert.deepEqual(identity(await users.authenticate('alice', PASSWORD)), alice);
   assert.equal(await sessionCount(pool, alice.id), 1);
 });
 
@@ -165,7 +186,7 @@ withStore('the password is stored only as a scrypt hash and no query result expo
   assert.match(rows[0].password_hash, /^scrypt\$16384\$8\$1\$/);
   assert.ok(!rows[0].password_hash.includes(PASSWORD));
 
-  const everything = JSON.stringify([alice, await users.list(), await users.getById(alice.id), await users.authenticate('alice', PASSWORD)]);
+  const everything = JSON.stringify([alice, await users.list(), await users.getById(alice.id), identity(await users.authenticate('alice', PASSWORD))]);
   assert.ok(!everything.includes('scrypt'));
   assert.ok(!everything.includes(PASSWORD));
 });

@@ -3,7 +3,7 @@ const express = require('express');
 const cookieParser = require('cookie-parser');
 const multer = require('multer');
 const { createSessionStore, SessionError } = require('./sessions');
-const { authRouter, requireAuth, sameOrigin } = require('./auth');
+const { authRouter, requireAuth, sameOrigin, bodyParserErrorHandler } = require('./auth');
 const { saveCaptchaImage } = require('./captcha-images');
 const { runBatch } = require('./stream');
 const {
@@ -37,11 +37,12 @@ function createApp({ automation = require('./automation'), users, sessions, thro
   app.use(express.static(path.join(__dirname, '..', 'public')));
 
   // Everything under /api refuses a cross-origin write, and only /api/auth/* is reachable without signing in.
-  // The large JSON parser comes after the guard, so nobody unauthenticated can make the server read a big body.
+  // The large JSON parser exists only under /api and comes after the sign-in check, so nobody who is not signed in can
+  // make the server read or parse a big body. (/api/auth has its own small parser, in the auth router.)
   app.use('/api', sameOrigin());
   app.use('/api/auth', authRouter({ users, sessions, throttle, cookieSecure: config.cookieSecure }));
   app.use('/api', requireAuth(sessions));
-  app.use(express.json({ limit: '5mb' }));
+  app.use('/api', express.json({ limit: '5mb' }));
 
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok' });
@@ -247,6 +248,9 @@ function createApp({ automation = require('./automation'), users, sessions, thro
     }
     return res.status(400).json({ status: 'INVALID_INPUT', message: 'Unsupported export format. Choose csv or xlsx.' });
   });
+
+  // A body that could not be parsed is the caller's error (400/413), and is not logged: the error carries the raw body.
+  app.use(bodyParserErrorHandler);
 
   app.use((error, _req, res, next) => {
     if (res.headersSent) {

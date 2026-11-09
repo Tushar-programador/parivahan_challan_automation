@@ -73,8 +73,11 @@ function createUserStore(pool) {
       }
     },
 
-    // Returns {id, username}, or null for an unknown user, a wrong password or an inactive user. Never says which.
-    // Every path does exactly one password check, so timing reveals neither which usernames exist nor who is disabled.
+    // Returns {id, username, passwordHash}, or null for an unknown user, a wrong password or an inactive user. Never
+    // says which. Every path does exactly one password check, so timing reveals neither which usernames exist nor who
+    // is disabled.
+    // passwordHash is the stored scrypt string. It is for the caller to hand straight to sessions.create, which only
+    // opens a session while that is still the user's hash. It must never be sent to a client or written to a log.
     async authenticate(username, password) {
       const name = normalizeUsername(username);
       let row;
@@ -83,7 +86,7 @@ function createUserStore(pool) {
       }
       const matches = await passwords.verifyPassword(password, row ? row.password_hash : await dummyHash);
       if (!row || !matches || !row.is_active) return null;
-      return { id: row.id, username: row.username };
+      return { id: row.id, username: row.username, passwordHash: row.password_hash };
     },
 
     // Only active users; a disabled user's still-open session stops working here.
@@ -107,14 +110,16 @@ function createUserStore(pool) {
       });
     },
 
-    // Disabling also signs the user out everywhere. False when there is no such user.
+    // Disabling and enabling both sign the user out everywhere: disabling so no session outlives it, enabling so that
+    // a session a racing login slipped in while the user was disabled does not come back to life. False when there is
+    // no such user.
     async setActive(username, active) {
       if (typeof active !== 'boolean') throw new TypeError('active must be true or false');
       const name = normalizeUsername(username);
       return inTransaction(pool, async (client) => {
         const { rows } = await client.query('update users set is_active = $1 where username = $2 returning id', [active, name]);
         if (rows.length === 0) return false;
-        if (!active) await client.query('delete from sessions where user_id = $1', [rows[0].id]);
+        await client.query('delete from sessions where user_id = $1', [rows[0].id]);
         return true;
       });
     },
