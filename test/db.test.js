@@ -45,6 +45,66 @@ test('FINAL_BANK_STATUSES=" success , Paid " becomes ["SUCCESS","PAID"]; ENABLE_
   assert.equal(loadConfig({ ...base, ENABLE_MANUAL_CAPTCHA: 'yes' }).enableManualCaptcha, false);
 });
 
+const BASE_ENV = { DATABASE_URL: 'postgres://x' };
+
+test('DATABASE_URL is trimmed, and blank counts as missing', () => {
+  assert.equal(loadConfig({ DATABASE_URL: '  postgres://x  ' }).databaseUrl, 'postgres://x');
+  for (const value of ['', ' ', '   \t ']) {
+    assert.throws(() => loadConfig({ DATABASE_URL: value }), /DATABASE_URL/, JSON.stringify(value));
+  }
+});
+
+test('DATABASE_SSL accepts only unset/empty, false, true and no-verify; anything else throws naming the variable', () => {
+  assert.equal(loadConfig(BASE_ENV).databaseSsl, false);
+  assert.equal(loadConfig({ ...BASE_ENV, DATABASE_SSL: '' }).databaseSsl, false);
+  assert.equal(loadConfig({ ...BASE_ENV, DATABASE_SSL: 'false' }).databaseSsl, false);
+  assert.equal(loadConfig({ ...BASE_ENV, DATABASE_SSL: 'true' }).databaseSsl, true);
+  assert.equal(loadConfig({ ...BASE_ENV, DATABASE_SSL: 'no-verify' }).databaseSsl, 'no-verify');
+  for (const value of ['TRUE', 'True', 'require', '1', 'yes', 'on', ' true', 'true ', 'No-Verify', ' ']) {
+    assert.throws(() => loadConfig({ ...BASE_ENV, DATABASE_SSL: value }), /DATABASE_SSL/, JSON.stringify(value));
+  }
+});
+
+test('SESSION_TTL_HOURS is a positive number (decimals allowed); empty means 12; anything else throws naming the variable', () => {
+  assert.equal(loadConfig(BASE_ENV).sessionTtlHours, 12);
+  assert.equal(loadConfig({ ...BASE_ENV, SESSION_TTL_HOURS: '' }).sessionTtlHours, 12);
+  assert.equal(loadConfig({ ...BASE_ENV, SESSION_TTL_HOURS: '24' }).sessionTtlHours, 24);
+  assert.equal(loadConfig({ ...BASE_ENV, SESSION_TTL_HOURS: '0.5' }).sessionTtlHours, 0.5);
+  for (const value of ['2h', 'abc', '0', '0.0', '-1', 'NaN', 'Infinity', '1e3', '0x10', ' ', '1,5']) {
+    assert.throws(() => loadConfig({ ...BASE_ENV, SESSION_TTL_HOURS: value }), /SESSION_TTL_HOURS must be a positive number/, JSON.stringify(value));
+  }
+});
+
+test('TRUST_PROXY accepts unset/empty, true, false and a non-negative integer; anything else throws naming the variable', () => {
+  assert.equal(loadConfig(BASE_ENV).trustProxy, false);
+  assert.equal(loadConfig({ ...BASE_ENV, TRUST_PROXY: '' }).trustProxy, false);
+  assert.equal(loadConfig({ ...BASE_ENV, TRUST_PROXY: 'false' }).trustProxy, false);
+  assert.equal(loadConfig({ ...BASE_ENV, TRUST_PROXY: 'true' }).trustProxy, true);
+  assert.equal(loadConfig({ ...BASE_ENV, TRUST_PROXY: '0' }).trustProxy, 0);
+  assert.equal(loadConfig({ ...BASE_ENV, TRUST_PROXY: '2' }).trustProxy, 2);
+  for (const value of ['TRUE', 'True', 'yes', '1.5', '-1', 'abc', '1 hop', ' ', ' 2']) {
+    assert.throws(() => loadConfig({ ...BASE_ENV, TRUST_PROXY: value }), /TRUST_PROXY/, JSON.stringify(value));
+  }
+});
+
+test('PORT is an integer from 1 to 65535; empty means 3000; anything else throws naming the variable', () => {
+  assert.equal(loadConfig(BASE_ENV).port, 3000);
+  assert.equal(loadConfig({ ...BASE_ENV, PORT: '' }).port, 3000);
+  assert.equal(loadConfig({ ...BASE_ENV, PORT: '1' }).port, 1);
+  assert.equal(loadConfig({ ...BASE_ENV, PORT: '8080' }).port, 8080);
+  assert.equal(loadConfig({ ...BASE_ENV, PORT: '65535' }).port, 65535);
+  for (const value of ['0', '65536', '70000', '80.5', '-1', 'abc', '80a', ' ', ' 80', '1e3']) {
+    assert.throws(() => loadConfig({ ...BASE_ENV, PORT: value }), /PORT must be a whole number from 1 to 65535/, JSON.stringify(value));
+  }
+});
+
+test('config errors never echo the rejected value', () => {
+  assert.throws(
+    () => loadConfig({ ...BASE_ENV, DATABASE_SSL: 'sekrit-value' }),
+    (error) => /DATABASE_SSL/.test(error.message) && !error.message.includes('sekrit-value')
+  );
+});
+
 test('migrate creates users, sessions, records, client_records and a second run applies nothing', async () => {
   const pool = await createTestPool({ migrate: false });
   try {
@@ -99,6 +159,13 @@ test('deleting a user removes their sessions and client_records but keeps the sh
   } finally {
     await pool.end();
   }
+});
+
+// pg-mem already returns numbers for bigint, so the test below cannot prove the parser. This one can, with no database.
+test('src/db.js registers a parser that turns int8 text into a JS number', () => {
+  const { types } = require('pg');
+  assert.strictEqual(types.getTypeParser(types.builtins.INT8)('42'), 42);
+  assert.strictEqual(types.getTypeParser(types.builtins.INT8, 'text')('9007199254740991'), 9007199254740991);
 });
 
 test('ids and counts come back as numbers', async () => {
