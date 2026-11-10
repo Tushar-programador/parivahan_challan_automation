@@ -181,7 +181,7 @@ function createApp({ automation = require('./automation'), users, sessions, thro
     } catch (error) {
       const key = normalizeApplicationNumber(applicationNo);
       report(`Unexpected error in ${where} for ${key}: ${describeError(error)}`);
-      return toClientResult({ status: 'WEBSITE_ERROR', applicationNo: key });
+      return toClientResult({ status: 'WEBSITE_ERROR', applicationNo: key }, { log: report });
     }
   };
 
@@ -225,7 +225,7 @@ function createApp({ automation = require('./automation'), users, sessions, thro
     }
 
     try {
-      const search = createClientSearch(lookupNumber, { userId: req.user.id, cancelled: trackClient(res) });
+      const search = createClientSearch(lookupNumber, { userId: req.user.id, cancelled: trackClient(res), log: report });
       return res.json(await search(applicationNo));
     } catch (error) {
       return sendUnexpected(res, error, 'POST /api/transaction/search');
@@ -244,7 +244,7 @@ function createApp({ automation = require('./automation'), users, sessions, thro
     }
 
     const cancelled = trackClient(res);
-    const search = forBatch(createClientSearch(lookupNumber, { userId: req.user.id, cancelled }), 'POST /api/transaction/search-stream');
+    const search = forBatch(createClientSearch(lookupNumber, { userId: req.user.id, cancelled, log: report }), 'POST /api/transaction/search-stream');
 
     res.type('application/x-ndjson');
     res.flushHeaders();
@@ -298,7 +298,7 @@ function createApp({ automation = require('./automation'), users, sessions, thro
 
       // The same path as search-stream, collected in input order instead of as each one finishes.
       const cancelled = trackClient(res);
-      const search = forBatch(createClientSearch(lookupNumber, { userId: req.user.id, cancelled }), 'POST /api/transaction/bulk');
+      const search = forBatch(createClientSearch(lookupNumber, { userId: req.user.id, cancelled, log: report }), 'POST /api/transaction/bulk');
       const results = new Array(applicationNumbers.length);
       await runBatch(applicationNumbers, search, ({ index, result }) => {
         if (cancelled()) return false;
@@ -318,7 +318,9 @@ function createApp({ automation = require('./automation'), users, sessions, thro
   });
 
   // Export results the UI already collected, without re-running the searches. The posted results are rebuilt from the
-  // client vocabulary first, so a file only ever holds text this service wrote.
+  // client vocabulary first: the statuses and messages are ours, only the whitelisted data is kept, and a data value that
+  // names the source is blanked. The number and the other values are the client's own text and are written as posted.
+  // Nothing is logged for the blanking here (no logger is passed): it is text the client posted, not ours to copy into the log.
   app.post('/api/export', async (req, res) => {
     const items = req.body && req.body.results;
     const format = String(req.query.format || 'csv').toLowerCase();
@@ -341,9 +343,10 @@ function createApp({ automation = require('./automation'), users, sessions, thro
   });
 
   // Keep this after every /api route. It answers an unknown /api path without repeating the path back: that text would
-  // be one more place for a client to read a word we do not want to say.
+  // be one more place for a client to read a word we do not want to say. Its status is NO_SUCH_ROUTE and not NOT_FOUND,
+  // which a lookup uses for "no record for this number": a route that does not exist must never look like that answer.
   app.use('/api', (_req, res) => {
-    res.status(404).json({ status: 'NOT_FOUND', message: 'Not found.' });
+    res.status(404).json({ status: 'NO_SUCH_ROUTE', message: 'Not found.' });
   });
 
   // A body that could not be parsed is the caller's error (400/413), and is not logged: the error carries the raw body.

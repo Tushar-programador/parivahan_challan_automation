@@ -4,7 +4,7 @@ const zlib = require('node:zlib');
 const ExcelJS = require('exceljs');
 const { parse } = require('csv-parse/sync');
 const { startTestApp, foundResult, SOURCE_WORDS, LEAK } = require('./helpers/test-app');
-const { toClientResult, createClientSearch } = require('../src/present');
+const { toClientResult, sanitizeResult, createClientSearch, DATA_FIELDS } = require('../src/present');
 const { createApp, defaultLog } = require('../src/app');
 const { createXlsx, parseApplicationNumbers, InvalidInputError } = require('../src/bulk');
 
@@ -12,7 +12,8 @@ const { createXlsx, parseApplicationNumbers, InvalidInputError } = require('../s
 const UNAVAILABLE_TEXT = 'We could not get this one right now. Please try again in a little while.';
 const INVALID_INPUT_TEXT = 'Enter 6-50 letters, numbers or hyphens.';
 const WENT_WRONG = { status: 'ERROR', message: 'Something went wrong. Please try again.' };
-const NOT_FOUND_API = { status: 'NOT_FOUND', message: 'Not found.' };
+// The answer for a path that is not a route. Its status is none of the four a lookup uses (NOT_FOUND means "no record").
+const NO_SUCH_ROUTE = { status: 'NO_SUCH_ROUTE', message: 'Not found.' };
 const CLIENT_STATUSES = ['FOUND', 'NOT_FOUND', 'INVALID_INPUT', 'UNAVAILABLE'];
 
 // What the source says when it fails: a URL, its name and the browser's own error text.
@@ -41,6 +42,12 @@ function post(t, path, body, cookie, { signal, headers } = {}) {
 
 async function streamLines(response) {
   return (await response.text()).split('\n').filter(Boolean).map((line) => JSON.parse(line));
+}
+
+// The rows of a results csv as objects keyed by the column labels, so a test reads a cell by its name.
+function csvRows(csv) {
+  const [header, ...rows] = parse(csv);
+  return rows.map((row) => Object.fromEntries(header.map((label, index) => [label, row[index]])));
 }
 
 // Every part of an .xlsx file (it is a zip), as one string: the sheet, the shared strings, the document properties.
@@ -108,6 +115,33 @@ const FULL_DATA = {
   statusDescription: 'Paid'
 };
 
+// Two source cells that name the source (a word, and a URL), and one that is fine. A client must get '' for the first two.
+const DIRTY_DETAILS = {
+  paymentGateway: 'Vahan Portal Gateway',
+  statusDescription: 'see https://example.org/receipt',
+  bankRefNo: 'ok-123'
+};
+// What a client gets for foundResult(number, DIRTY_DETAILS): the two dirty values blanked, every other value as it was.
+const BLANKED_DATA = {
+  vehicleNo: 'HR31V0031',
+  transactionNo: '',
+  paymentId: '',
+  paymentDate: '',
+  paymentConfirmationDate: '',
+  paymentGateway: '',
+  bankRefNo: 'ok-123',
+  grn: '',
+  cin: '',
+  amount: '500',
+  bankStatus: 'SUCCESS',
+  statusDescription: ''
+};
+// The lines the log gets for DIRTY_DETAILS, in field order, one per blanked field.
+const redactedLines = (applicationNo) => [
+  `Redacted client data field paymentGateway for ${applicationNo}: Vahan Portal Gateway`,
+  `Redacted client data field statusDescription for ${applicationNo}: see https://example.org/receipt`
+];
+
 // ---------- the presenter ----------
 
 test('toClientResult keeps only the whitelisted fields for FOUND and formats asOf as ISO', () => {
@@ -163,6 +197,108 @@ test('a FOUND without a record or without a usable lastFoundAt is UNAVAILABLE: a
   }
 });
 
+test('a data value that holds a source word or a URL is blanked as a whole, in any field and any case; nothing else changes', () => {
+  const allFields = (value) => Object.fromEntries(DATA_FIELDS.map((field) => [field, value]));
+  const present = (record) => toClientResult({ status: 'FOUND', applicationNo: 'FNHR100001', record: { ...FULL_RECORD, ...record } });
+
+  const dirty = [
+    'parivahan', 'PARIVAHAN', 'vahan', 'Vahan', 'Vahan Portal Gateway', 'portal', 'paid at the Portal', 'captcha', 'CAPTCHA-1',
+    'gov.in', 'nic.GOV.IN', 'playwright', 'Chromium', 'ddddocr', 'DdDdOcr',
+    'http://example.org', 'HTTPS://EXAMPLE.ORG', 'see https://example.org/receipt'
+  ];
+  for (const value of dirty) assert.deepEqual(present(allFields(value)).data, allFields(''), value);
+
+  // A value that only looks a little like one is left alone.
+  const clean = ['ok-123', 'Paid', 'SUCCESS', '500', '', 'port', 'van', 'gov-in', 'govXin', 'http', 'https:/'];
+  for (const value of clean) assert.deepEqual(present(allFields(value)).data, allFields(value), value);
+
+  // Only the dirty fields are blanked, each in its own place: the field names, their order, the number and asOf stay.
+  const mixed = present({ paymentGateway: 'Vahan Portal Gateway', statusDescription: 'see https://example.org/receipt' });
+  assert.deepEqual(mixed, {
+    status: 'FOUND',
+    applicationNo: 'FNHR100001',
+    data: { ...FULL_DATA, paymentGateway: '', statusDescription: '' },
+    asOf: '2026-11-09T10:20:30.123Z'
+  });
+  assert.deepEqual(Object.keys(mixed.data), DATA_FIELDS);
+
+  // The number is the client's own: it is never blanked, not even when it holds one of the words.
+  assert.equal(toClientResult({ status: 'FOUND', applicationNo: 'PORTAL-100001', record: FULL_RECORD }).applicationNo, 'PORTAL-100001');
+  assert.equal(toClientResult({ status: 'FOUND', applicationNo: '', record: { ...FULL_RECORD, applicationNo: 'VAHAN-100001' } }).applicationNo, 'VAHAN-100001');
+
+  // Presentation only: the record it was given is not changed.
+  const input = { status: 'FOUND', applicationNo: 'FNHR100001', record: { ...FULL_RECORD, paymentGateway: 'Vahan Portal Gateway' } };
+  const before = structuredClone(input);
+  toClientResult(input);
+  assert.deepEqual(input, before);
+});
+
+test('toClientResult tells its log once per blanked field, in field order, with the original value; the log is optional', () => {
+  const logged = [];
+  const log = (line) => { logged.push(line); };
+  const record = { ...FULL_RECORD, paymentGateway: 'Vahan Portal Gateway', cin: 'ChromiumX', statusDescription: 'see https://example.org/receipt' };
+  const found = { status: 'FOUND', applicationNo: 'FNHR100001', record };
+  const expected = {
+    status: 'FOUND',
+    applicationNo: 'FNHR100001',
+    data: { ...FULL_DATA, paymentGateway: '', cin: '', statusDescription: '' },
+    asOf: '2026-11-09T10:20:30.123Z'
+  };
+
+  assert.deepEqual(toClientResult(found, { log }), expected);
+  assert.deepEqual(logged, [
+    'Redacted client data field paymentGateway for FNHR100001: Vahan Portal Gateway',
+    'Redacted client data field cin for FNHR100001: ChromiumX',
+    'Redacted client data field statusDescription for FNHR100001: see https://example.org/receipt'
+  ]);
+
+  // The number in a line is the one the client's result carries, which falls back to the record's.
+  logged.length = 0;
+  toClientResult({ status: 'FOUND', record: { ...record, applicationNo: 'FNHR100009' } }, { log });
+  assert.equal(logged.length, 3);
+  assert.ok(logged.every((line) => line.includes(' for FNHR100009: ')), logged.join('\n'));
+
+  // Nothing to blank, nothing logged.
+  logged.length = 0;
+  toClientResult({ status: 'FOUND', applicationNo: 'FNHR100001', record: FULL_RECORD }, { log });
+  assert.deepEqual(logged, []);
+
+  // The second argument is optional, and so is its log: a call with one argument is as before, and blanks just the same.
+  assert.deepEqual(toClientResult(found), expected);
+  assert.deepEqual(toClientResult(found, {}), expected);
+  assert.deepEqual(toClientResult(found, undefined), expected);
+});
+
+test('toClientResult tells its log about a FOUND it cannot present, once and with the reason, and about no other status', () => {
+  const logged = [];
+  const log = (line) => { logged.push(line); };
+  const unavailable = { status: 'UNAVAILABLE', applicationNo: 'FNHR100001', message: UNAVAILABLE_TEXT };
+  const unusableDates = [undefined, null, '', 'yesterday', new Date('nope'), {}, true];
+
+  for (const [result, reason] of [
+    [{ status: 'FOUND', applicationNo: 'FNHR100001' }, 'no record'],
+    [{ status: 'FOUND', applicationNo: 'FNHR100001', record: null }, 'no record'],
+    [{ status: 'FOUND', applicationNo: 'FNHR100001', record: 'text' }, 'no record'],
+    [{ status: 'FOUND', applicationNo: 'FNHR100001', data: FULL_DATA }, 'no record'],
+    ...unusableDates.map((lastFoundAt) => [{ status: 'FOUND', applicationNo: 'FNHR100001', record: { ...FULL_RECORD, lastFoundAt } }, 'no usable lastFoundAt']),
+    // Nothing is presented, so no value is blanked: the one line is all there is.
+    [{ status: 'FOUND', applicationNo: 'FNHR100001', record: { ...FULL_RECORD, lastFoundAt: 'yesterday', paymentGateway: 'Vahan Portal Gateway' } }, 'no usable lastFoundAt']
+  ]) {
+    logged.length = 0;
+    assert.deepEqual(toClientResult(result, { log }), unavailable, reason);
+    assert.deepEqual(logged, [`Found result for FNHR100001 could not be presented: ${reason}`], JSON.stringify(result));
+  }
+
+  // Any other answer is an ordinary one, or a failure the lookup service has logged already: the presenter adds nothing.
+  logged.length = 0;
+  for (const status of ['NOT_FOUND', 'INVALID_INPUT', 'TIMEOUT', 'WEBSITE_ERROR', 'CAPTCHA_REQUIRED', 'CANCELLED', 'SOMETHING_NEW', undefined]) {
+    toClientResult({ status, applicationNo: 'FNHR100001' }, { log });
+  }
+  toClientResult({ status: 'FOUND', applicationNo: 'FNHR100001', record: FULL_RECORD }, { log });
+  toClientResult(null, { log });
+  assert.deepEqual(logged, []);
+});
+
 test('TIMEOUT, WEBSITE_ERROR, CAPTCHA_REQUIRED, CANCELLED and an unknown status all become UNAVAILABLE with the fixed message and no raw message', () => {
   for (const status of ['TIMEOUT', 'WEBSITE_ERROR', 'CAPTCHA_REQUIRED', 'CAPTCHA_WRONG', 'CANCELLED', 'ERROR', 'UNAVAILABLE', 'found', 'Not_Found', 'SOMETHING_NEW', '', undefined, null, 42]) {
     const result = toClientResult({ status, applicationNo: 'FNHR100001', message: SOURCE_FAILURE, record: FULL_RECORD, data: FULL_DATA, source: 'live' });
@@ -208,6 +344,54 @@ test('the per-number wrapper presents the answer, passes cancelled and owner, an
 test('the per-number wrapper lets a throwing lookup reject, so the caller decides what the client sees', async () => {
   const search = createClientSearch(async () => { throw new Error('boom'); }, { userId: 1 });
   await assert.rejects(search('FNHR100001'), /boom/);
+});
+
+test('the per-number wrapper gives its log to the presenter, and the log is optional', async () => {
+  const logged = [];
+  const log = (line) => { logged.push(line); };
+  const answers = {
+    FNHR100001: { status: 'FOUND', applicationNo: 'FNHR100001', record: { ...FULL_RECORD, paymentGateway: 'Vahan Portal Gateway' } },
+    FNHR100002: { status: 'FOUND', applicationNo: 'FNHR100002' }
+  };
+  const lookup = async (_userId, applicationNo) => answers[applicationNo];
+
+  const search = createClientSearch(lookup, { userId: 1, log });
+  assert.equal((await search('FNHR100001')).data.paymentGateway, '');
+  assert.deepEqual(logged, ['Redacted client data field paymentGateway for FNHR100001: Vahan Portal Gateway']);
+  logged.length = 0;
+  assert.equal((await search('FNHR100002')).status, 'UNAVAILABLE');
+  assert.deepEqual(logged, ['Found result for FNHR100002 could not be presented: no record']);
+
+  // Without a log it presents just the same.
+  const quiet = createClientSearch(lookup, { userId: 1 });
+  assert.equal((await quiet('FNHR100001')).data.paymentGateway, '');
+  assert.equal((await quiet('FNHR100002')).status, 'UNAVAILABLE');
+});
+
+test('sanitizeResult blanks source words in the posted FOUND data the same way, and its log is optional', () => {
+  const posted = {
+    status: 'FOUND',
+    applicationNo: 'FNHR100001',
+    data: { vehicleNo: 'HR31V0031', ...DIRTY_DETAILS, amount: 500, bankStatus: 'SUCCESS', cin: ['playwright', 'x'], rawStatus: 'SUCCESS' },
+    message: 'from the portal'
+  };
+  const expected = { status: 'FOUND', applicationNo: 'FNHR100001', data: { ...BLANKED_DATA, cin: '' } };
+
+  assert.deepEqual(sanitizeResult(posted), expected);
+
+  const logged = [];
+  assert.deepEqual(sanitizeResult(posted, { log: (line) => { logged.push(line); } }), expected);
+  assert.deepEqual(logged, [
+    'Redacted client data field paymentGateway for FNHR100001: Vahan Portal Gateway',
+    'Redacted client data field cin for FNHR100001: playwright,x',
+    'Redacted client data field statusDescription for FNHR100001: see https://example.org/receipt'
+  ]);
+
+  // Everything else about a posted result is as before: a status that is not ours is UNAVAILABLE, and a log changes nothing.
+  const failed = { status: 'WEBSITE_ERROR', applicationNo: 'FNHR100002', message: SOURCE_FAILURE };
+  assert.deepEqual(sanitizeResult(failed, { log: () => {} }), { status: 'UNAVAILABLE', applicationNo: 'FNHR100002', message: UNAVAILABLE_TEXT });
+  assert.deepEqual(sanitizeResult(failed), { status: 'UNAVAILABLE', applicationNo: 'FNHR100002', message: UNAVAILABLE_TEXT });
+  assert.deepEqual(sanitizeResult(null), { status: 'UNAVAILABLE', applicationNo: '', message: UNAVAILABLE_TEXT });
 });
 
 test('the default server log writes to console.error unless LOG_LEVEL is silent', (t) => {
@@ -277,7 +461,7 @@ test('a failure whose raw message contains the source URL never reaches the clie
   });
 });
 
-test('the bulk csv and xlsx downloads and the export of such a failure never name the source', async () => {
+test('the bulk csv and xlsx downloads of such a failure never name the source', async () => {
   await withApp({ automation: { searchTransaction: failingSearch } }, async (t) => {
     const cookie = await t.cookieFor('alice');
     const bulkCsv = await post(t, '/api/transaction/bulk?format=csv', { applicationNos: ['FNHR100001'] }, cookie);
@@ -345,6 +529,34 @@ test('a server log that throws changes nothing a client sees', async () => {
   });
 });
 
+test('a server log that throws does not stop a blanked answer or an unpresentable one', async () => {
+  const log = () => { throw new Error('the log itself is broken'); };
+  const lookup = async (_userId, applicationNo) => (applicationNo === 'FNHR100001'
+    ? { status: 'FOUND', applicationNo, record: { ...FULL_RECORD, applicationNo, paymentGateway: 'Vahan Portal Gateway' } }
+    : { status: 'FOUND', applicationNo });
+  const unavailable = (applicationNo) => ({ status: 'UNAVAILABLE', applicationNo, message: UNAVAILABLE_TEXT });
+
+  await withApp({ automation: {}, lookup, log }, async (t) => {
+    const cookie = await t.cookieFor('alice');
+
+    const blanked = await post(t, '/api/transaction/search', { applicationNo: 'FNHR100001' }, cookie);
+    assert.equal(blanked.status, 200);
+    assert.deepEqual((await blanked.json()).data, { ...FULL_DATA, paymentGateway: '' });
+    const missing = await post(t, '/api/transaction/search', { applicationNo: 'FNHR100002' }, cookie);
+    assert.equal(missing.status, 200);
+    assert.deepEqual(await missing.json(), unavailable('FNHR100002'));
+
+    const stream = await post(t, '/api/transaction/search-stream', { applicationNos: ['FNHR100001', 'FNHR100002'] }, cookie);
+    const byIndex = Object.fromEntries((await streamLines(stream)).map((line) => [line.index, line.result]));
+    assert.equal(byIndex[0].data.paymentGateway, '');
+    assert.deepEqual(byIndex[1], unavailable('FNHR100002'));
+
+    const bulk = await post(t, '/api/transaction/bulk', { applicationNos: ['FNHR100001', 'FNHR100002'] }, cookie);
+    const { results } = await bulk.json();
+    assert.deepEqual(results.map((row) => [row.status, row.paymentGateway]), [['FOUND', ''], ['UNAVAILABLE', '']]);
+  });
+});
+
 const FOUND_DETAILS = {
   transactionNo: 'TXN1',
   paymentId: 'PAY1',
@@ -398,6 +610,112 @@ test('a found number is stored, linked to the signed-in user, and the next answe
     const second = await post(t, '/api/transaction/search', { applicationNo: 'FNHR100001' }, cookie);
     assert.deepEqual(await second.json(), first);
     assert.equal(optionsSeen.length, 1, 'the second answer came from our own data');
+  });
+});
+
+test('a source word or URL inside a data value is blanked for the client, in single search, stream and bulk csv', async () => {
+  const automation = { searchTransaction: async (applicationNo) => foundResult(applicationNo, DIRTY_DETAILS) };
+  await withApp({ automation }, async (t) => {
+    const cookie = await t.cookieFor('alice');
+
+    const single = await post(t, '/api/transaction/search', { applicationNo: 'FNHR100001' }, cookie);
+    assert.equal(single.status, 200);
+    const singleText = await single.text();
+    assert.equal(LEAK.test(singleText), false, singleText);
+    const singleBody = JSON.parse(singleText);
+    assert.equal(singleBody.status, 'FOUND');
+    assert.deepEqual(singleBody.data, BLANKED_DATA);
+    assert.deepEqual(t.logged, redactedLines('FNHR100001'), 'the log has one line per blanked field');
+
+    t.logged.length = 0;
+    const stream = await post(t, '/api/transaction/search-stream', { applicationNos: ['FNHR100002'] }, cookie);
+    assert.equal(stream.status, 200);
+    const streamText = await stream.clone().text();
+    assert.equal(LEAK.test(streamText), false, streamText);
+    const lines = await streamLines(stream);
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].result.status, 'FOUND');
+    assert.deepEqual(lines[0].result.data, BLANKED_DATA);
+    assert.deepEqual(t.logged, redactedLines('FNHR100002'));
+
+    t.logged.length = 0;
+    const bulk = await post(t, '/api/transaction/bulk?format=csv', { applicationNos: ['FNHR100003'] }, cookie);
+    assert.equal(bulk.status, 200);
+    const csv = await bulk.text();
+    assert.equal(LEAK.test(csv), false, csv);
+    const [row] = csvRows(csv);
+    assert.equal(row['Application No'], 'FNHR100003');
+    assert.equal(row.Status, 'FOUND');
+    assert.equal(row['Payment Gateway'], '');
+    assert.equal(row['Status Description'], '');
+    assert.equal(row['Bank Ref No'], 'ok-123');
+    assert.equal(row['Vehicle No'], 'HR31V0031');
+    assert.equal(row.Amount, '500');
+    assert.deepEqual(t.logged, redactedLines('FNHR100003'));
+  });
+});
+
+test('redaction does not change the stored record', async () => {
+  let searches = 0;
+  const automation = { searchTransaction: async (applicationNo) => { searches += 1; return foundResult(applicationNo, DIRTY_DETAILS); } };
+  const original = { vehicleNo: 'HR31V0031', ...DIRTY_DETAILS, amount: '500', bankStatus: 'SUCCESS' };
+  const stored = async (t) => {
+    const row = await t.stores.records.get('FNHR100001');
+    return row && { vehicleNo: row.vehicleNo, paymentGateway: row.paymentGateway, bankRefNo: row.bankRefNo, statusDescription: row.statusDescription, amount: row.amount, bankStatus: row.bankStatus };
+  };
+  await withApp({ automation }, async (t) => {
+    const cookie = await t.cookieFor('alice');
+
+    // The first answer is the live one: the client's copy is blanked, the saved row is what the source said.
+    const first = await (await post(t, '/api/transaction/search', { applicationNo: 'FNHR100001' }, cookie)).json();
+    assert.equal(first.status, 'FOUND');
+    assert.equal(first.data.paymentGateway, '');
+    assert.equal(first.data.statusDescription, '');
+    assert.deepEqual(await stored(t), original);
+    const rowAfterFirst = await t.stores.records.get('FNHR100001');
+    assert.equal(rowAfterFirst.paymentGateway, 'Vahan Portal Gateway');
+
+    // The second answer comes from that saved row: blanked again, and the row is still as it was.
+    const second = await (await post(t, '/api/transaction/search', { applicationNo: 'FNHR100001' }, cookie)).json();
+    assert.equal(searches, 1, 'the second answer came from our own data');
+    assert.deepEqual(second, first);
+    assert.deepEqual(await t.stores.records.get('FNHR100001'), rowAfterFirst, 'the whole row is untouched');
+  });
+});
+
+test('a FOUND that cannot be presented becomes UNAVAILABLE and is logged once', async () => {
+  const lookup = async (_userId, applicationNo) => (applicationNo === 'FNHR100001'
+    ? { status: 'FOUND', applicationNo, record: { ...FULL_RECORD, applicationNo, lastFoundAt: new Date('not a date') } }
+    : { status: 'FOUND', applicationNo });
+  const cases = [
+    ['FNHR100001', 'Found result for FNHR100001 could not be presented: no usable lastFoundAt'],
+    ['FNHR100002', 'Found result for FNHR100002 could not be presented: no record']
+  ];
+  const lines = cases.map(([, line]) => line);
+  await withApp({ automation: {}, lookup }, async (t) => {
+    const cookie = await t.cookieFor('alice');
+
+    for (const [applicationNo, line] of cases) {
+      t.logged.length = 0;
+      const response = await post(t, '/api/transaction/search', { applicationNo }, cookie);
+      assert.equal(response.status, 200);
+      const text = await response.text();
+      assert.deepEqual(JSON.parse(text), { status: 'UNAVAILABLE', applicationNo, message: UNAVAILABLE_TEXT });
+      assert.equal(/presented|lastFoundAt|no record/i.test(text), false, 'the reason is for the operator, not the client');
+      assert.deepEqual(t.logged, [line]);
+    }
+
+    // The stream and bulk go through the same wrapper: each number is logged once, in whatever order they finish.
+    t.logged.length = 0;
+    const stream = await post(t, '/api/transaction/search-stream', { applicationNos: cases.map(([applicationNo]) => applicationNo) }, cookie);
+    const streamed = await streamLines(stream);
+    assert.deepEqual(streamed.map((line) => line.result.status), ['UNAVAILABLE', 'UNAVAILABLE']);
+    assert.deepEqual([...t.logged].sort(), [...lines].sort());
+
+    t.logged.length = 0;
+    const bulk = await post(t, '/api/transaction/bulk', { applicationNos: cases.map(([applicationNo]) => applicationNo) }, cookie);
+    assert.deepEqual((await bulk.json()).results.map((row) => row.status), ['UNAVAILABLE', 'UNAVAILABLE']);
+    assert.deepEqual([...t.logged].sort(), [...lines].sort());
   });
 });
 
@@ -600,7 +918,7 @@ test('createXlsx names the workbook creator "Data export" unless told otherwise,
   }
 });
 
-test('/api/export writes only text this service wrote, whatever the posted results say', async () => {
+test('/api/export gives every posted result a status and message of ours, and keeps only the whitelisted FOUND data, written as posted', async () => {
   await withApp({ automation: {} }, async (t) => {
     const cookie = await t.cookieFor('alice');
     const posted = [
@@ -639,6 +957,40 @@ test('/api/export writes only text this service wrote, whatever the posted resul
       assert.equal(refused.status, 400);
       assert.deepEqual(await refused.json(), { status: 'INVALID_INPUT', message });
     }
+  });
+});
+
+test('/api/export blanks source words in posted FOUND data too', async () => {
+  // The export never searches; the empty automation stub makes sure nothing here could reach the real source.
+  await withApp({ automation: {} }, async (t) => {
+    const cookie = await t.cookieFor('alice');
+    const posted = [
+      { status: 'FOUND', applicationNo: 'FNHR100001', data: { vehicleNo: 'HR31V0031', ...DIRTY_DETAILS, amount: '500' } },
+      { status: 'FOUND', applicationNo: 'FNHR100002', data: { vehicleNo: 'HR31V0032', paymentGateway: 'PARIVAHAN', cin: 'Chromium-1', grn: ['playwright', 'x'], amount: 600, bankRefNo: 'ok-456' } },
+      { status: 'FOUND', applicationNo: 'FNHR100003', data: { vehicleNo: 'HR31V0033', paymentGateway: 'GATE', bankRefNo: 'ok-789' } }
+    ];
+
+    const csvResponse = await post(t, '/api/export?format=csv', { results: posted }, cookie);
+    assert.equal(csvResponse.status, 200);
+    const csv = await csvResponse.text();
+    assert.equal(LEAK.test(csv), false, csv);
+    const rows = csvRows(csv);
+    const pick = (row) => [row['Application No'], row.Status, row['Vehicle No'], row['Payment Gateway'], row['Bank Ref No'], row.CIN, row.GRN, row['Status Description'], row.Amount];
+    assert.deepEqual(rows.map(pick), [
+      ['FNHR100001', 'FOUND', 'HR31V0031', '', 'ok-123', '', '', '', '500'],
+      ['FNHR100002', 'FOUND', 'HR31V0032', '', 'ok-456', '', '', '', '600'],
+      ['FNHR100003', 'FOUND', 'HR31V0033', 'GATE', 'ok-789', '', '', '', '']
+    ]);
+
+    const xlsxResponse = await post(t, '/api/export?format=xlsx', { results: posted }, cookie);
+    assert.equal(xlsxResponse.status, 200);
+    const xlsx = Buffer.from(await xlsxResponse.arrayBuffer());
+    assert.equal(SOURCE_WORDS.test(xlsxParts(xlsx)), false);
+    const sheet = (await loadWorkbook(xlsx)).getWorksheet('Transaction Results');
+    assert.equal(LEAK.test(JSON.stringify(sheet.getSheetValues())), false);
+    assert.deepEqual(['C2', 'I2', 'L2'].map((cell) => sheet.getCell(cell).value), ['HR31V0031', 'ok-123', '500']);
+    assert.deepEqual(['H2', 'M2'].map((cell) => String(sheet.getCell(cell).value ?? '')), ['', ''], 'the blanked cells are empty');
+    assert.equal(sheet.getCell('H4').value, 'GATE', 'a value that is fine is written as posted');
   });
 });
 
@@ -715,8 +1067,38 @@ test('an unknown /api path is a 404 that does not repeat the path', async () => 
     for (const [method, path] of [['GET', '/api/nothing-here'], ['POST', '/api/captcha-session/parivahan'], ['DELETE', '/api/vahan%3Cb%3E']]) {
       const response = await fetch(`${t.baseUrl}${path}`, { method, headers: { cookie, 'content-type': 'application/json' }, body: method === 'GET' ? undefined : '{}' });
       assert.equal(response.status, 404, path);
-      assert.deepEqual(await response.json(), NOT_FOUND_API);
+      assert.deepEqual(await response.json(), NO_SUCH_ROUTE);
     }
+  });
+});
+
+test('unknown /api paths answer 404 NO_SUCH_ROUTE without echoing the path', async () => {
+  const lookup = async (_userId, applicationNo) => ({ status: 'NOT_FOUND', applicationNo });
+  await withApp({ automation: {}, lookup }, async (t) => {
+    const cookie = await t.cookieFor('alice');
+
+    // A number we hold nothing for is NOT_FOUND on a 200. A route that does not exist must never look like that.
+    const noRecord = await post(t, '/api/transaction/search', { applicationNo: 'FNHR100001' }, cookie);
+    assert.equal(noRecord.status, 200);
+    assert.deepEqual(await noRecord.json(), { status: 'NOT_FOUND', applicationNo: 'FNHR100001' });
+
+    const bodies = new Set();
+    for (const [method, path] of [
+      ['GET', '/api/nothing-here'],
+      ['POST', '/api/transaction/nothing-here'],
+      ['PUT', '/api/captcha/session'],
+      ['DELETE', '/api/vahan%3Cb%3E/parivahan?q=portal']
+    ]) {
+      const response = await fetch(`${t.baseUrl}${path}`, { method, headers: { cookie, 'content-type': 'application/json' }, body: method === 'GET' ? undefined : '{}' });
+      assert.equal(response.status, 404, `${method} ${path}`);
+      const text = await response.text();
+      const body = JSON.parse(text);
+      assert.deepEqual(body, NO_SUCH_ROUTE, `${method} ${path}`);
+      assert.equal(CLIENT_STATUSES.includes(body.status), false, 'none of the statuses a lookup uses');
+      assert.equal(LEAK.test(text), false, text);
+      bodies.add(text);
+    }
+    assert.equal(bodies.size, 1, 'the same body whatever the path, so nothing of the path is in it');
   });
 });
 
