@@ -88,4 +88,15 @@ async function createTestPool({ migrate = true } = {}) {
   return pool;
 }
 
-module.exports = { startTestApp, createTestPool };
+// A FOUND lookup result as the automation returns it, for tests that store or serve records.
+// `overrides` replace fields of `data` (for example { amount: '600' }).
+function foundResult(applicationNo, overrides = {}) {
+  return {
+    status: 'FOUND',
+    applicationNo,
+    data: { vehicleNo: 'HR31V0031', amount: '500', status: 'SUCCESS', statusDescription: 'Paid', ...overrides },
+    rawStatus: 'SUCCESS'
+  };
+}
+
+module.exports = { startTestApp, createTestPool, foundResult };
