@@ -1,6 +1,7 @@
 const { loadConfig } = require('./config');
 const { createPool, migrate } = require('./db');
 const { createUserStore } = require('./users');
+const { createRecordStore } = require('./records');
 const { createSessionStore, createLoginThrottle } = require('./auth');
 const { createApp } = require('./app');
 const { closeBrowser } = require('./automation');
@@ -20,7 +21,8 @@ async function main() {
   const users = createUserStore(pool);
   const sessions = createSessionStore(pool, { ttlHours: config.sessionTtlHours });
   const throttle = createLoginThrottle();
-  const { app, closeCaptchaSessions } = createApp({ users, sessions, throttle, config });
+  const records = createRecordStore(pool);
+  const { app, closeCaptchaSessions } = createApp({ users, sessions, throttle, config, records });
 
   // Expired login sessions are already refused; this only keeps the table small.
   const purge = () => sessions.purgeExpired().catch((error) => console.error(`[WARN] could not purge expired sessions: ${error.message}`));

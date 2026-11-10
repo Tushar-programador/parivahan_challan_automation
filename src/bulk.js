@@ -27,9 +27,12 @@ const RESULT_COLUMNS = [
   ['message', 'Message']
 ];
 
+// A problem with what the caller sent (an empty or unreadable CSV, too many numbers). Its message is meant for the caller.
+class InvalidInputError extends Error {}
+
 function parseApplicationNumbers(csvText) {
   if (typeof csvText !== 'string' || !csvText.trim()) {
-    throw new Error('The CSV file is empty.');
+    throw new InvalidInputError('The CSV file is empty.');
   }
 
   let records;
@@ -41,11 +44,11 @@ function parseApplicationNumbers(csvText) {
       trim: true
     });
   } catch (error) {
-    throw new Error(`Could not parse CSV: ${error.message}`);
+    throw new InvalidInputError(`Could not parse CSV: ${error.message}`);
   }
 
   if (!records.length) {
-    throw new Error('The CSV file does not contain any application numbers.');
+    throw new InvalidInputError('The CSV file does not contain any application numbers.');
   }
 
   const firstCell = normalizeApplicationNumber(records[0][0] || '').replace(/[^A-Z0-9]/g, '');
@@ -63,10 +66,10 @@ function parseApplicationNumbers(csvText) {
     .filter(Boolean);
 
   if (!values.length) {
-    throw new Error('The CSV file does not contain any application numbers.');
+    throw new InvalidInputError('The CSV file does not contain any application numbers.');
   }
   if (values.length > MAX_BULK_ROWS) {
-    throw new Error(`Bulk searches are limited to ${MAX_BULK_ROWS} application numbers per upload.`);
+    throw new InvalidInputError(`Bulk searches are limited to ${MAX_BULK_ROWS} application numbers per upload.`);
   }
 
   return values;
@@ -157,9 +160,9 @@ function createCsv(results) {
   return `${[header, ...rows].join('\r\n')}\r\n`;
 }
 
-async function createXlsx(results) {
+async function createXlsx(results, { creator = 'Data export' } = {}) {
   const workbook = new ExcelJS.Workbook();
-  workbook.creator = 'Parivahan Transaction Automation';
+  workbook.creator = creator;
   const worksheet = workbook.addWorksheet('Transaction Results');
 
   worksheet.columns = RESULT_COLUMNS.map(([key, header]) => ({
@@ -185,6 +188,7 @@ module.exports = {
   DEFAULT_DELAY_MS,
   MAX_BULK_ROWS,
   RESULT_COLUMNS,
+  InvalidInputError,
   parseApplicationNumbers,
   normalizeBulkResult,
   processBulk,

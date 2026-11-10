@@ -204,7 +204,7 @@ withApp('a broken or oversize login body is 400 or 413 BAD_REQUEST and does not 
     assert.equal(huge.status, 413);
     assert.deepEqual(await huge.json(), BAD_REQUEST);
   });
-  assert.equal(lines.some((line) => line.includes('leaky-secret-value')), false, 'the password was logged');
+  assert.equal([...lines, ...t.logged].some((line) => line.includes('leaky-secret-value')), false, 'the password was logged');
   assert.equal(await sessionCount(t.pool), 0);
 });
 
@@ -232,6 +232,7 @@ withApp('body-parser errors are client errors everywhere: 400 or 413 BAD_REQUEST
     assert.deepEqual(await huge.json(), BAD_REQUEST);
   });
   assert.deepEqual(lines, []);
+  assert.deepEqual(t.logged, [], 'nothing went to the server log either');
 });
 
 withApp('after 5 wrong passwords the 6th attempt, even with the right password, is 429 with Retry-After', { users: [['alice', PASSWORD], ['bob', PASSWORD]] }, async (t) => {
@@ -452,7 +453,7 @@ withApp('the stored password hash never appears in a login response, a header or
     }
   });
   assert.equal(seen.length, 8);
-  for (const text of [...seen, ...lines]) {
+  for (const text of [...seen, ...lines, ...t.logged]) {
     assert.equal(text.includes(hash), false);
     assert.equal(text.includes('scrypt$'), false);
   }
@@ -493,13 +494,13 @@ withApp('a missing, malformed, unknown or JSON-looking cookie is 401, never a se
 
 withApp('POST /api/transaction/search is 401 without a cookie and 200 with one', { automation: searchStub }, async (t) => {
   const url = `${t.baseUrl}/api/transaction/search`;
-  const denied = await postJson(url, { applicationNo: 'FNHR1' });
+  const denied = await postJson(url, { applicationNo: 'FNHR100001' });
   assert.equal(denied.status, 401);
   assert.equal((await denied.json()).status, 'UNAUTHORIZED');
 
-  const allowed = await postJson(url, { applicationNo: 'FNHR1' }, { cookie: await t.cookieFor('alice') });
+  const allowed = await postJson(url, { applicationNo: 'FNHR100001' }, { cookie: await t.cookieFor('alice') });
   assert.equal(allowed.status, 200);
-  assert.deepEqual(await allowed.json(), { status: 'NOT_FOUND', applicationNo: 'FNHR1' });
+  assert.deepEqual(await allowed.json(), { status: 'NOT_FOUND', applicationNo: 'FNHR100001' });
 });
 
 withApp('every /api route except /api/auth/* needs a cookie', { automation: {} }, async (t) => {
@@ -602,14 +603,14 @@ withApp('a POST with a foreign Origin header and a valid cookie is 403', { autom
   const url = `${t.baseUrl}/api/transaction/search`;
 
   for (const origin of ['https://evil.example', 'http://127.0.0.1:1', 'null', 'not a url']) {
-    const response = await postJson(url, { applicationNo: 'FNHR1' }, { cookie, origin });
+    const response = await postJson(url, { applicationNo: 'FNHR100001' }, { cookie, origin });
     assert.equal(response.status, 403, origin);
     assert.equal((await response.json()).status, 'FORBIDDEN');
   }
 
   // The same page's own origin, and requests with no Origin at all (scripts, curl), are fine.
-  assert.equal((await postJson(url, { applicationNo: 'FNHR1' }, { cookie, origin: t.baseUrl })).status, 200);
-  assert.equal((await postJson(url, { applicationNo: 'FNHR1' }, { cookie })).status, 200);
+  assert.equal((await postJson(url, { applicationNo: 'FNHR100001' }, { cookie, origin: t.baseUrl })).status, 200);
+  assert.equal((await postJson(url, { applicationNo: 'FNHR100001' }, { cookie })).status, 200);
   // Reads are not state changing.
   const me = await fetch(`${t.baseUrl}/api/auth/me`, { headers: { cookie, origin: 'https://evil.example' } });
   assert.equal(me.status, 200);

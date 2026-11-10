@@ -21,14 +21,14 @@ test('GET /health answers ok', async () => {
   }
 });
 
-test('POST /api/transaction/search returns the injected search result', async () => {
+test('POST /api/transaction/search answers with the lookup result as a client may see it', async () => {
   const t = await startTestApp({
-    automation: { searchTransaction: async (no) => ({ status: 'NOT_FOUND', applicationNo: no }) }
+    automation: { searchTransaction: async (no) => ({ status: 'NOT_FOUND', applicationNo: no, message: 'raw message from the source' }) }
   });
   try {
-    const response = await postJson(`${t.baseUrl}/api/transaction/search`, { applicationNo: 'FNHR1' }, { cookie: await t.cookieFor('alice') });
+    const response = await postJson(`${t.baseUrl}/api/transaction/search`, { applicationNo: 'FNHR100001' }, { cookie: await t.cookieFor('alice') });
     assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { status: 'NOT_FOUND', applicationNo: 'FNHR1' });
+    assert.deepEqual(await response.json(), { status: 'NOT_FOUND', applicationNo: 'FNHR100001' });
   } finally {
     await t.stop();
   }

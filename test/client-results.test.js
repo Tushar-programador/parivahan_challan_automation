@@ -1,12 +1,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const zlib = require('node:zlib');
 const ExcelJS = require('exceljs');
-const JSZip = require('jszip'); // exceljs depends on it; used here only to read every part of an .xlsx
 const { parse } = require('csv-parse/sync');
 const { startTestApp, foundResult, SOURCE_WORDS, LEAK } = require('./helpers/test-app');
 const { toClientResult, createClientSearch } = require('../src/present');
 const { createApp, defaultLog } = require('../src/app');
-const { createXlsx } = require('../src/bulk');
+const { createXlsx, parseApplicationNumbers, InvalidInputError } = require('../src/bulk');
 
 // The fixed texts, written out in full on purpose: a change to them must be a visible change to this file.
 const UNAVAILABLE_TEXT = 'We could not get this one right now. Please try again in a little while.';
@@ -44,11 +44,24 @@ async function streamLines(response) {
 }
 
 // Every part of an .xlsx file (it is a zip), as one string: the sheet, the shared strings, the document properties.
-async function xlsxParts(buffer) {
-  const zip = await JSZip.loadAsync(buffer);
+// A minimal reader: it takes the entries from the zip's central directory, which is all a file written by exceljs needs.
+function xlsxParts(buffer) {
+  const end = buffer.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06])); // the end-of-central-directory record
+  const entries = buffer.readUInt16LE(end + 10);
+  let offset = buffer.readUInt32LE(end + 16);
   const parts = [];
-  for (const [name, file] of Object.entries(zip.files)) {
-    if (!file.dir) parts.push(`${name}\n${await file.async('string')}`);
+  for (let i = 0; i < entries; i += 1) {
+    const method = buffer.readUInt16LE(offset + 10);
+    const size = buffer.readUInt32LE(offset + 20);
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    const local = buffer.readUInt32LE(offset + 42);
+    const name = buffer.toString('utf8', offset + 46, offset + 46 + nameLength);
+    const start = local + 30 + buffer.readUInt16LE(local + 26) + buffer.readUInt16LE(local + 28);
+    const data = buffer.subarray(start, start + size);
+    parts.push(`${name}\n${(method === 8 ? zlib.inflateRawSync(data) : data).toString('utf8')}`);
+    offset += 46 + nameLength + extraLength + commentLength;
   }
   return parts.join('\n');
 }
@@ -214,6 +227,14 @@ test('the default server log writes to console.error unless LOG_LEVEL is silent'
   }
 });
 
+test('every validation failure of the CSV parser is an InvalidInputError, so the route can tell it from a bug', () => {
+  const tooMany = Array.from({ length: 1001 }, (_, i) => `FNHR${100000 + i}`).join('\n');
+  for (const csv of [' \r\n', '"never closed\n', 'Application No\r\n', tooMany, undefined]) {
+    assert.throws(() => parseApplicationNumbers(csv), InvalidInputError, JSON.stringify(csv)?.slice(0, 30));
+  }
+  assert.deepEqual(parseApplicationNumbers('FNHR100001\n'), ['FNHR100001']);
+});
+
 test('createApp refuses to start without records or a lookup', () => {
   const deps = { users: {}, sessions: {}, throttle: {}, config: { trustProxy: false } };
   assert.throws(() => createApp(deps), /records or a lookup/);
@@ -266,7 +287,7 @@ test('the bulk csv and xlsx downloads and the export of such a failure never nam
 
     const bulkXlsx = await post(t, '/api/transaction/bulk?format=xlsx', { applicationNos: ['FNHR100001'] }, cookie);
     const buffer = Buffer.from(await bulkXlsx.arrayBuffer());
-    assert.equal(SOURCE_WORDS.test(await xlsxParts(buffer)), false);
+    assert.equal(SOURCE_WORDS.test(xlsxParts(buffer)), false);
     const sheet = (await loadWorkbook(buffer)).getWorksheet('Transaction Results');
     assert.equal(LEAK.test(JSON.stringify(sheet.getSheetValues())), false);
     assert.equal(sheet.getCell('B2').value, 'UNAVAILABLE');
@@ -303,48 +324,70 @@ test('a lookup that throws gives the fixed "Something went wrong" message and lo
   });
 });
 
-test('a FOUND answer carries data and asOf, has no rawStatus or source key, is stored and linked, and is served from the store next time', async () => {
+test('a server log that throws changes nothing a client sees', async () => {
+  const log = () => { throw new Error('the log itself is broken'); };
+  const lookup = async (_userId, applicationNo) => {
+    if (applicationNo === 'FNHR100002') throw new Error('lookup broke');
+    return { status: 'NOT_FOUND', applicationNo };
+  };
+  await withApp({ automation: {}, lookup, log }, async (t) => {
+    const cookie = await t.cookieFor('alice');
+    const ok = await post(t, '/api/transaction/search', { applicationNo: 'FNHR100001' }, cookie);
+    assert.deepEqual(await ok.json(), { status: 'NOT_FOUND', applicationNo: 'FNHR100001' });
+
+    const broken = await post(t, '/api/transaction/search', { applicationNo: 'FNHR100002' }, cookie);
+    assert.equal(broken.status, 500);
+    assert.deepEqual(await broken.json(), WENT_WRONG);
+
+    const stream = await post(t, '/api/transaction/search-stream', { applicationNos: ['FNHR100001', 'FNHR100002'] }, cookie);
+    const lines = await streamLines(stream);
+    assert.deepEqual(lines.map((line) => line.result.status).sort(), ['NOT_FOUND', 'UNAVAILABLE']);
+  });
+});
+
+const FOUND_DETAILS = {
+  transactionNo: 'TXN1',
+  paymentId: 'PAY1',
+  paymentDate: '01-Nov-2026',
+  paymentConfirmationDate: '02-Nov-2026',
+  paymentGateway: 'GATE',
+  bankRefNo: 'BANK1',
+  grn: 'GRN1',
+  cin: 'CIN1'
+};
+
+test('a FOUND answer carries data and asOf and has no rawStatus or source key', async () => {
+  const automation = { searchTransaction: async (applicationNo) => foundResult(applicationNo, FOUND_DETAILS) };
+  await withApp({ automation }, async (t) => {
+    const cookie = await t.cookieFor('alice');
+    const response = await post(t, '/api/transaction/search', { applicationNo: ' fnhr100001 ' }, cookie);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+
+    assert.deepEqual(Object.keys(body).sort(), ['applicationNo', 'asOf', 'data', 'status']);
+    assert.equal(body.status, 'FOUND');
+    assert.equal(body.applicationNo, 'FNHR100001');
+    assert.deepEqual(body.data, { vehicleNo: 'HR31V0031', ...FOUND_DETAILS, amount: '500', bankStatus: 'SUCCESS', statusDescription: 'Paid' });
+    assert.equal(new Date(body.asOf).toISOString(), body.asOf, 'asOf is an ISO string');
+    assert.ok(Math.abs(Date.now() - Date.parse(body.asOf)) < 60 * 1000, 'asOf is about now for a record found just now');
+    assert.equal(/rawStatus|"source"|"record"|"id"|"live"|"stored"/.test(JSON.stringify(body)), false);
+    assert.equal('rawStatus' in body || 'source' in body || 'id' in body, false);
+    assert.equal('rawStatus' in body.data || 'source' in body.data || 'status' in body.data, false);
+  });
+});
+
+test('a found number is stored, linked to the signed-in user, and the next answer comes from our own data', async () => {
   const optionsSeen = [];
   const search = async (applicationNo, options) => {
     optionsSeen.push(options);
-    return foundResult(applicationNo, {
-      transactionNo: 'TXN1',
-      paymentId: 'PAY1',
-      paymentDate: '01-Nov-2026',
-      paymentConfirmationDate: '02-Nov-2026',
-      paymentGateway: 'GATE',
-      bankRefNo: 'BANK1',
-      grn: 'GRN1',
-      cin: 'CIN1'
-    });
+    return foundResult(applicationNo, FOUND_DETAILS);
   };
   await withApp({ automation: { searchTransaction: search } }, async (t) => {
     const cookie = await t.cookieFor('alice');
     const { rows: [alice] } = await t.pool.query("select id from users where username = 'alice'");
 
-    const first = await post(t, '/api/transaction/search', { applicationNo: ' fnhr100001 ' }, cookie);
-    assert.equal(first.status, 200);
-    const body = await first.json();
-    assert.deepEqual(Object.keys(body).sort(), ['applicationNo', 'asOf', 'data', 'status']);
-    assert.equal(body.status, 'FOUND');
-    assert.equal(body.applicationNo, 'FNHR100001');
-    assert.deepEqual(body.data, {
-      vehicleNo: 'HR31V0031',
-      transactionNo: 'TXN1',
-      paymentId: 'PAY1',
-      paymentDate: '01-Nov-2026',
-      paymentConfirmationDate: '02-Nov-2026',
-      paymentGateway: 'GATE',
-      bankRefNo: 'BANK1',
-      grn: 'GRN1',
-      cin: 'CIN1',
-      amount: '500',
-      bankStatus: 'SUCCESS',
-      statusDescription: 'Paid'
-    });
-    assert.equal(new Date(body.asOf).toISOString(), body.asOf, 'asOf is an ISO string');
-    assert.ok(Math.abs(Date.now() - Date.parse(body.asOf)) < 60 * 1000, 'asOf is about now for a record found just now');
-    assert.equal(/rawStatus|"source"|"record"|"id"|"live"|"stored"/.test(JSON.stringify(body)), false);
+    const first = await (await post(t, '/api/transaction/search', { applicationNo: 'FNHR100001' }, cookie)).json();
+    assert.equal(first.status, 'FOUND');
 
     // The route handed the lookup the signed-in user and a way to tell that the client left.
     assert.equal(optionsSeen.length, 1);
@@ -353,7 +396,7 @@ test('a FOUND answer carries data and asOf, has no rawStatus or source key, is s
     assert.equal((await t.stores.records.list(alice.id)).total, 1, 'the record is linked to the signed-in user');
 
     const second = await post(t, '/api/transaction/search', { applicationNo: 'FNHR100001' }, cookie);
-    assert.deepEqual(await second.json(), body);
+    assert.deepEqual(await second.json(), first);
     assert.equal(optionsSeen.length, 1, 'the second answer came from our own data');
   });
 });
@@ -452,6 +495,7 @@ test('bulk accepts a CSV upload, keeps its validation messages, and refuses a ba
     const ok = await upload('Application No,Notes\r\nFNHR100001,a\r\nFNHR100002,b\r\n');
     assert.equal(ok.status, 200);
     assert.deepEqual((await ok.json()).results.map((row) => row.applicationNo), ['FNHR100001', 'FNHR100002']);
+    assert.equal(searches, 2, 'the numbers went through the shared lookup');
 
     const empty = await upload(' \r\n');
     assert.equal(empty.status, 400);
@@ -544,7 +588,12 @@ test('createXlsx names the workbook creator "Data export" unless told otherwise,
     assert.equal(workbook.creator, expected);
   }
   const buffer = await createXlsx([{ applicationNo: 'FNHR100001', status: 'FOUND', vehicleNo: 'HR31V0031' }]);
-  assert.equal(SOURCE_WORDS.test(await xlsxParts(buffer)), false);
+  const parts = xlsxParts(buffer);
+  // The reader really sees inside the file (the check below would pass on an empty string too).
+  assert.match(parts, /docProps\/core\.xml/);
+  assert.match(parts, /Data export/);
+  assert.match(parts, /HR31V0031/);
+  assert.equal(SOURCE_WORDS.test(parts), false);
   const workbook = await loadWorkbook(buffer);
   for (const property of ['creator', 'lastModifiedBy', 'company', 'manager', 'title', 'subject', 'keywords', 'category', 'description']) {
     assert.equal(SOURCE_WORDS.test(String(workbook[property] ?? '')), false, property);
@@ -577,7 +626,7 @@ test('/api/export writes only text this service wrote, whatever the posted resul
     assert.equal(rows[4][13], INVALID_INPUT_TEXT);
 
     const xlsx = Buffer.from(await (await post(t, '/api/export?format=xlsx', { results: posted }, cookie)).arrayBuffer());
-    assert.equal(SOURCE_WORDS.test(await xlsxParts(xlsx)), false);
+    assert.equal(SOURCE_WORDS.test(xlsxParts(xlsx)), false);
     assert.equal(LEAK.test(JSON.stringify((await loadWorkbook(xlsx)).getWorksheet('Transaction Results').getSheetValues())), false);
 
     for (const [query, body, message] of [
